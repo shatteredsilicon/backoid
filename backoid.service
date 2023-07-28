@@ -1,0 +1,9 @@
+[Unit]
+Description=Backup ZFS snapshots
+Requires=zfs.target
+After=zfs.target
+
+[Service]
+Environment=TZ=UTC
+Type=oneshot
+ExecStart=/usr/sbin/backoid

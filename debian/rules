@@ -1,0 +1,35 @@
+#!/usr/bin/make -f
+# See debhelper(7) for more info
+
+# output every command that modifies files on the build system.
+#export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+DESTDIR = $(CURDIR)/debian/backoid
+override_dh_auto_install:
+	install -d $(DESTDIR)/etc/backoid
+	install -m 644 backoid.defaults.conf $(DESTDIR)/etc/backoid
+
+	install -d $(DESTDIR)/lib/systemd/system
+	install -m 644 backoid.service backoid.timer \
+		$(DESTDIR)/lib/systemd/system
+
+	install -d $(DESTDIR)/usr/sbin
+	install -m 755 \
+		backoid \
+		$(DESTDIR)/usr/sbin
+
+	install -d $(DESTDIR)/usr/share/doc/backoid
+	install -m 644 backoid.conf \
+		$(DESTDIR)/usr/share/doc/backoid/backoid.conf.example
+
+override_dh_installinit:
+	dh_installinit --noscripts
+
+override_dh_systemd_enable:
+	dh_systemd_enable backoid.timer
+
+override_dh_systemd_start:
+	dh_systemd_start backoid.timer

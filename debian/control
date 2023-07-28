@@ -1,0 +1,26 @@
+Source: backoid
+Section: utils
+Priority: optional
+Maintainer: Jason Ng <oblitorum@gmail.net>
+Build-Depends: debhelper (>= 10)
+Standards-Version: 4.1.2
+Homepage: https://github.com/shatteredsilicon/backoid
+Vcs-Git: https://github.com/shatteredsilicon/backoid.git
+Vcs-Browser: https://github.com/shatteredsilicon/backoid
+
+Package: backoid
+Architecture: all
+Depends: libcapture-tiny-perl,
+         libconfig-inifiles-perl,
+         zfsutils-linux | zfs,
+         rclone,
+         ${misc:Depends},
+         ${perl:Depends}
+Recommends: gzip,
+            pv,
+            zstd,
+            pbzip2,
+            bzip2,
+            pigz,
+            lz4
+Description: Sanoid/Syncoid-like utility for object storage backup targets

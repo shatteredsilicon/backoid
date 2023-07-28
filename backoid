@@ -1,0 +1,600 @@
+#!/usr/bin/perl
+
+# this software is licensed for use under the Free Software Foundation's GPL v3.0 license, as retrieved
+# from http://www.gnu.org/licenses/gpl-3.0.html on 2014-11-17.  A copy should also be available in this
+# project's Git repository at https://github.com/shatteredsilicon/backoid/blob/master/LICENSE.
+
+$::VERSION = '1.0';
+
+use strict;
+use warnings;
+use Config::IniFiles; # read samba-style conf file
+use Getopt::Long qw(:config auto_version auto_help);
+use Pod::Usage;
+use Time::Local;
+use Sys::Hostname;
+use Capture::Tiny ':all';
+use File::Spec::Functions 'catfile';
+use File::Basename;
+use File::Path qw(make_path rmtree);
+use Digest::SHA qw(sha256_hex);
+
+my $ps = 'ps';
+my $pv = 'pv';
+my $zfs = 'zfs';
+my $tar = 'tar';
+my $rclone = 'rclone';
+
+my $DEFAULT_COMPRESSION = 'zstd';
+my $DEFAULT_RETENTION = '7d';
+
+my %args = (
+    "configdir" => "/etc/backoid",
+	"cache-dir" => "/var/cache/backoid",
+	"run-dir" => "/var/run/backoid"
+);
+GetOptions(\%args, "configdir=s", "cache-dir=s", "run-dir=s", "debug", "verbose") or pod2usage;
+
+my $conf_file = "$args{'configdir'}/backoid.conf";
+my $default_conf_file = "$args{'configdir'}/backoid.defaults.conf";
+
+my $debug = $args{'debug'};
+my $verbose = $args{'verbose'};
+
+my $cache_dir = $args{'cache-dir'};
+my $run_dir = $args{'run-dir'};
+my $tmp_dir = "/tmp/backoid";
+
+make_path($cache_dir);
+make_path($run_dir);
+
+my $snapshot_cache = "$cache_dir/snapshots.txt";
+my $object_ttl = 2592000; # in seconds, 30 days
+
+if (scalar(@ARGV) != 0) {
+	pod2usage(2);
+	exit 127;
+}
+
+my $sourceisroot = 0 + ($< == 0);
+my %config = parse_config($conf_file, $default_conf_file);
+my %cached_snapshots = parse_snapshot_cache();
+
+upload_snapshots();
+purge_snapshots();
+
+sub upload_snapshots {
+	if (checklock('backoid_uploading')) {
+		writelock('backoid_uploading');
+		if (! (-d $tmp_dir)) {
+			make_path($tmp_dir) or die "couldn't create temporary directory $tmp_dir";
+		}
+
+		my @present_snapshots = ();
+		foreach my $dataset (keys %{$config{'datasets'}}) {
+			push(@present_snapshots, @{$config{'datasets'}{$dataset}{'snapshots'}});
+			upload_dataset(%{$config{'datasets'}{$dataset}});
+		}
+
+		if (-d $tmp_dir) {
+			rmtree($tmp_dir) or warn "ERROR: couldn't delete temporary directory $tmp_dir";
+		}
+
+		# remove snapshots from cached that is not present.
+		foreach my $snapshot (keys %cached_snapshots) {
+			if (grep $snapshot eq $_, @present_snapshots) {
+				next;
+			}
+
+			if ($debug) { print "DEBUG: deleting cached snapshot $snapshot ...\n"; }
+			delete $cached_snapshots{$snapshot};
+		}
+
+		write_snapshot_cache(%cached_snapshots);
+		removelock('backoid_uploading');
+	} else {
+		if ($verbose) { print "INFO: deferring snapshot uploading - valid uploading lock held by other backoid process.\n"; }
+	}
+}
+
+sub purge_snapshots {
+	foreach my $dataset (keys %{$config{'datasets'}}) {
+		my ($retention_number, $retention_suffix) = ($config{'datasets'}{$dataset}{'retention'} =~ /^(\d+)([hdwmy]?)$/);
+		if (! length($retention_number) && ! length($retention_suffix)) {
+			warn "CRITICAL ERROR: auto purge for dataset '$dataset' is cancelled, backoid doesn't know how to deal with retention '$config{'datasets'}{$dataset}{'retention'}'";
+			next;
+		}
+
+		# object list is ordered by modification,ascending
+		my @lines = `$rclone lsl --max-depth 1 $config{'datasets'}{$dataset}{'target'}`;
+		my @purging_objects = ();
+		foreach my $line (@lines) {
+			my ($size, $year, $month, $day, $hour, $minute, $second, $object) = $line =~ /^\s*(\d+)\s+(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.\d+\s+([^\s]+)/;
+			if (! length($object)) {
+				warn "CRITICAL ERROR: get unexpected line from rclone lsl output -> '$line'";
+				next;
+			}
+
+			my $trim_object = $object;
+			$trim_object =~ s/\.tar\.\w+$//;
+			if (! ($trim_object =~ /$config{'datasets'}{$dataset}{'pattern'}/)) {
+				next;
+			}
+
+			# auto purge by keeping certain amount of most recent snapshot tarballs,
+			# no need to check if the snapshot tarball is expired.
+			if ($retention_suffix eq '') {
+				my $datetime = "$year-$month-$day $hour:$minute:$second";
+				my $i = 0;
+				foreach my $purging_object (@purging_objects) {
+					if ($purging_object->{'datetime'} gt $datetime) {
+						last;
+					}
+
+					$i = $i + 1;
+				}
+				splice(@purging_objects, $i, 0, {
+					'datetime' => $datetime,
+					'object' => $object
+				});
+				next;
+			}
+
+			my $seconds = 60 * 60;
+			if ($retention_suffix eq 'h') {
+				$seconds = $seconds * $retention_number;
+			} elsif ($retention_suffix eq 'd') {
+				$seconds = $seconds * 24 * $retention_number;
+			} elsif ($retention_suffix eq 'w') {
+				$seconds = $seconds * 24 * 7 * $retention_number;
+			} elsif ($retention_suffix eq 'm') {
+				$seconds = $seconds * 24 * 30 * $retention_number;
+			} else { # year
+				$seconds = $seconds * 24 * 365 * $retention_number;
+			}
+
+			if (time() - timelocal($second,$minute,$hour,$day,$month-1,$year) < $seconds) {
+				next;
+			}
+
+			my $object_path = catfile($config{'datasets'}{$dataset}{'target'}, $object);
+			if ($debug) { print "DEBUG: found expired object $object_path\n"; }
+			system("$rclone deletefile $object_path") == 0
+				or warn "CRITICAL ERROR: purge object $object_path failed, exit code: $?";
+		}
+
+		if (scalar(@purging_objects) > 0 && scalar(@purging_objects) > $retention_number) {
+			for my $index (0 .. (scalar(@purging_objects) - $retention_number - 1)) {
+				my $object_path = catfile($config{'datasets'}{$dataset}{'target'}, $purging_objects[$index]->{'object'});
+				if ($debug) { print "DEBUG: purging object $object_path\n"; }
+				system("$rclone deletefile $object_path") == 0
+					or warn "CRITICAL ERROR: purge object $object_path failed, exit code: $?";
+			}
+		}
+	}
+}
+
+sub parse_config {
+	my ($conf_file, $default_conf_file) = @_;
+	my %config = (
+		'datasets' => {}
+	);
+
+	unless (-e $default_conf_file ) { die "FATAL: cannot load $default_conf_file - please restore a clean copy, this is not a user-editable file!"; }
+	unless (-e $conf_file ) { die "FATAL: cannot load $conf_file - please create a valid local config file before running backoid!"; }
+
+	tie my %defaults, 'Config::IniFiles', ( -file => $default_conf_file ) or die "FATAL: cannot load $default_conf_file - please restore a clean copy, this is not a user-editable file!";
+	tie my %ini, 'Config::IniFiles', ( -file => $conf_file ) or die "FATAL: cannot load $conf_file - please create a valid local config file before running backoid!";
+
+	my @istrue=(1,"true","True","TRUE","yes","Yes","YES","on","On","ON");
+
+	foreach my $section (keys %ini) {
+		# first up - die with honor if unknown parameters are set in any modules or templates by the user.
+		foreach my $key (keys %{$ini{$section}}) {
+			if (! defined ($defaults{'template_default'}{$key})) {
+				die "FATAL ERROR: I don't understand the setting $key you've set in \[$section\] in $conf_file.\n";
+			}
+
+			# in case of duplicate lines we will end up with an array of all values
+			my $value = $ini{$section}{$key};
+			if (ref($value) eq 'ARRAY') {
+				warn "duplicate key '$key' in section '$section', using the value from the first occurence and ignoring the others.\n";
+				$ini{$section}{$key} = $value->[0];
+			}
+		}
+
+		if ($section =~ /^template_/) { next; } # don't process templates directly
+
+		# set default values from %defaults, which can then be overridden by template
+        # and/or local settings within the module.
+		foreach my $key (keys %{$defaults{'template_default'}}) {
+			$config{'datasets'}{$section}{$key} = $defaults{'template_default'}{$key};
+		}
+
+		# override with values from user-defined default template, if any
+		foreach my $key (keys %{$ini{'template_default'}}) {
+			$config{'datasets'}{$section}{$key} = $ini{'template_default'}{$key};
+		}
+
+		# override with values from user-defined templates applied to this module,
+		# in the order they were specified (ie use_template = default,production,mytemplate)
+		if (defined $ini{$section}{'use_template'}) {
+			my @templates = split (' *, *',$ini{$section}{'use_template'});
+			foreach my $rawtemplate (@templates) {
+				# strip trailing whitespace
+				$rawtemplate =~ s/\s+$//g;
+
+				my $template = 'template_'.$rawtemplate;
+				foreach my $key (keys %{$ini{$template}}) {
+					$config{'datasets'}{$section}{$key} = $ini{$template}{$key};
+				}
+			}
+		}
+
+		# override with any locally set values in the module itself
+        foreach my $key (keys %{$ini{$section}}) {
+            $config{'datasets'}{$section}{$key} = $ini{$section}{$key};
+        }
+
+		# target not defined, which means no upload
+		if (!defined ($config{'datasets'}{$section}{'target'}) || !length ($config{'datasets'}{$section}{'target'})) {
+			delete $config{'datasets'}{$section};
+			next;
+		}
+
+		if ($config{'datasets'}{$section}{'retention'} eq '') {
+			$config{'datasets'}{$section}{'retention'} = $DEFAULT_RETENTION;
+		}
+
+		# section path is the section name
+		$config{'datasets'}{$section}{'path'} = $section;
+
+		my @zfs_datasets = get_zfs_datasets($config{'datasets'}{$section}{'path'}, 0);
+		my $zfs_dataset = shift @zfs_datasets;
+		$config{'datasets'}{$section}{'mountpoint'} = $zfs_dataset->{'mountpoint'};
+	}
+
+	foreach my $dataset (keys %{$config{'datasets'}}) {
+		$config{'datasets'}{$dataset}{'snapshots'} = [];
+
+		my @snapshots = get_snapshots($config{'datasets'}{$dataset}{'path'});
+		foreach my $snapshot (@snapshots) {
+			chomp $snapshot;
+			my $trim_snapshot = $snapshot;
+			$trim_snapshot =~ s/^$dataset@//;
+
+			if (! ($trim_snapshot =~ /$config{'datasets'}{$dataset}{'pattern'}/)) {
+				next;
+			}
+
+			if ($config{'datasets'}{$dataset}{'mountpoint'} ne "") {
+				$snapshot = catfile($config{'datasets'}{$dataset}{'mountpoint'}, ".zfs", "snapshot", "$trim_snapshot");
+			}
+
+			if ($debug) { print "DEBUG: found snapshot $snapshot\n"; }
+			push(@{$config{'datasets'}{$dataset}{'snapshots'}}, $snapshot);
+		}
+	}
+
+	return %config;
+}
+
+sub get_zfs_datasets {
+	my ($path, $recursive) = @_;
+	my $recursive_arg = '';
+	if ($recursive) {
+		$recursive_arg = 'r';
+	}
+
+	my $cmd = "$zfs list -o name,mountpoint -t filesystem,volume -H$recursive_arg $path";
+	if ($debug) { print "DEBUG: getting list of datasets of $path using '$cmd' ...\n"; }
+	my @lines = `$cmd`;
+	my $exit_code = $? >> 8;
+
+	if ($exit_code != 0) {
+		warn "CRITICAL ERROR: command '$cmd' failed with exit code: $exit_code";
+		return ();
+	}
+
+	my @datasets = ();
+	foreach my $line (@lines) {
+		my ($name, $mountpoint) = $line =~ /^([^\t]+)\t([^\t]+)/;
+		chomp $name;
+		chomp $mountpoint;
+
+		if (grep $mountpoint eq $_, ('-', 'legacy', 'none')) {
+			$mountpoint = '';
+		}
+
+		my %dataset = (
+			'name' => "$name",
+			'mountpoint' => "$mountpoint"
+		);
+		push(@datasets, \%dataset);
+	}
+
+	return @datasets;
+}
+
+sub get_snapshots {
+	my $path = shift;
+
+	my $cmd = "$zfs list -o name -t snapshot -H $path 2>&1";
+	 if ($debug) { print "DEBUG: getting list of snapshots of $path using '$cmd' ...\n"; }
+	my @snapshots = `$cmd`;
+	my $exit_code = $? >> 8;
+
+	if ($exit_code != 0) {
+		warn "CRITICAL ERROR: command '$cmd' failed with exit code: $exit_code";
+		return ();
+	}
+
+	return @snapshots;
+}
+
+sub upload_dataset {
+	my (%dataset) = @_;
+	my %compressor = get_compressor($dataset{'compression'}, $dataset{'compression_level'});
+
+	foreach my $snapshot (@{$dataset{'snapshots'}}) {
+		if (grep $snapshot eq $_, (keys %cached_snapshots)) {
+			# same snapshots were uploaded, ignore
+			if ($verbose) { print "INFO: deferring snapshot uploading - snapshot $snapshot already uploaded.\n"; }
+			next;
+		}
+
+		my $file_arg = '';
+		my $cmd = '';
+		my $snapshot_filepath = '';
+		if (-e $snapshot) {
+			$snapshot_filepath = $snapshot;
+		} else {
+			my $replace_snapshot = $snapshot;
+			$replace_snapshot =~ s#@#/#;
+			$snapshot_filepath = catfile($tmp_dir, $replace_snapshot);
+			make_path(dirname($snapshot_filepath));
+
+			$cmd = "$zfs send $snapshot > $snapshot_filepath";
+			if ($debug) { print "DEBUG: dumping snapshot $snapshot to $snapshot_filepath\n"; }
+			system("$cmd") == 0 or do {
+				warn "CRITICAL ERROR: command '$cmd' failed";
+				return;
+			};
+		}
+
+		my $snapshot_dir = dirname($snapshot_filepath);
+		my $snapshot_name = basename($snapshot_filepath);
+		my $remote_path = catfile($dataset{'target'}, $snapshot_name);
+
+		my $verbose_arg = '';
+		my $pv_cmd = '';
+		if ($verbose) {
+			$verbose_arg = '-v';
+			my ($snapshot_size) = `du -hs --apparent-size $snapshot_filepath` =~ /^\s*(\w+)\s+/;
+			$pv_cmd = "| $pv --name $snapshot_filepath -s $snapshot_size";
+		}
+
+		$cmd = "tar cf - -C $snapshot_dir $snapshot_name $pv_cmd | $compressor{'bin'} $compressor{'level'} - | $rclone $verbose_arg rcat $remote_path.tar.$compressor{'extension'}";
+		if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot with command '$cmd' ...\n"; }
+		system("$cmd") == 0 or do {
+			warn "CRITICAL ERROR: taring up and uploading snapshot $snapshot failed";
+			return;
+		};
+
+		$cached_snapshots{$snapshot} = 1;
+	}
+}
+
+sub get_compressor {
+	my ($compression, $level) = @_;
+	if (length $level) {
+		$level =~ s/^\s+|\s+$//g;
+	} else {
+		$level = '';
+	}
+
+	my %COMPRESS_ARGS = (
+		'bzip2' => {
+			bin 		=> 'bzip2',
+			level		=> '',
+			extension	=> 'bz2',
+		},
+		'gzip' => {
+			bin			=> 'gzip',
+			level		=> '',
+			extension	=> 'gz',
+		},
+		'lz4' => {
+			bin			=> 'lz4',
+			level		=> '',
+			extension	=> 'lz4',
+		},
+		'pbzip2' => {
+			bin			=> 'pbzip2',
+			level		=> '',
+			extension	=> 'bz2',
+		},
+		'pigz' => {
+			bin			=> 'pigz',
+			level		=> '',
+			extension	=> 'gz',
+		},
+		'zstd' => {
+			bin			=> 'zstd',
+			level		=> '',
+			extension	=> 'zst',
+		},
+		'pzstd' => {
+			bin			=> 'pzstd',
+			level		=> '',
+			extension	=> 'zst',
+		},
+		'pxz' => {
+			bin			=> 'pxz',
+			level		=> '',
+			extension	=> 'xz',
+		},
+		'xz' => {
+			bin			=> 'xz',
+			level		=> '',
+			extension	=> 'xz',
+		},
+	);
+
+	if ($compression eq '') {
+		$compression = $DEFAULT_COMPRESSION;
+	} elsif (!(grep $compression eq $_, ('bzip2', 'gzip', 'lz4', 'pbzip2', 'pigz', 'zstd', 'pzstd', 'pxz', 'xz', 'default'))) {
+		die "Unrecognised compression type '$compression'";
+	}
+
+	my %compressor = %{$COMPRESS_ARGS{$compression}};
+	if ($level ne '') {
+		$compressor{'level'} = "-$level";
+	}
+
+	return %compressor;
+}
+
+sub checklock {
+	# take argument $lockname.
+	#
+	# read $run_dir/$lockname.lock for a pid on first line and a mutex on second line.
+	#
+	# check process list to see if the pid from $run_dir/$lockname.lock is still active with
+	# the original mutex found in $run_dir/$lockname.lock.
+	#
+	# return:
+	#    0 if lock is present and valid for another process
+	#    1 if no lock is present
+	#    2 if lock is present, but we own the lock
+	#
+	# shorthand - any true return indicates we are clear to lock; a false return indicates
+	#             that somebody else already has the lock and therefore we cannot.
+	#
+
+	my $lockname = shift;
+	my $lockfile = "$run_dir/$lockname.lock";
+
+	if (! -e $lockfile) {
+		# no lockfile
+		return 1;
+	}
+	# make sure lockfile contains something
+	if ( -z $lockfile) {
+	        # zero size lockfile, something is wrong
+	        warn "WARN: deleting invalid/empty $lockfile\n";
+	        unlink $lockfile;
+	        return 1
+	}
+
+	# lockfile exists. read pid and mutex from it. see if it's our pid.  if not, see if
+	# there's still a process running with that pid and with the same mutex.
+
+	open FH, "< $lockfile" or die "ERROR: unable to open $lockfile";
+	my @lock = <FH>;
+	close FH;
+	# if we didn't get exactly 2 items from the lock file there is a problem
+	if (scalar(@lock) != 2) {
+	    warn "WARN: deleting invalid $lockfile\n";
+	    unlink $lockfile;
+	    return 1
+	}
+
+	my $lockmutex = pop(@lock);
+	my $lockpid = pop(@lock);
+
+	chomp $lockmutex;
+	chomp $lockpid;
+
+	if ($lockpid == $$) {
+		# we own the lockfile. no need to check any further.
+		return 2;
+	}
+	open PL, "$ps -p $lockpid -o args= |";
+	my @processlist = <PL>;
+	close PL;
+
+	my $checkmutex = pop(@processlist);
+	chomp $checkmutex;
+
+	if ($checkmutex eq $lockmutex) {
+		# lock exists, is valid, is not owned by us - return false
+		return 0;
+	} else {
+		# lock is present but not valid - remove and return true
+		unlink $lockfile;
+		return 1;
+	}
+}
+
+sub removelock {
+	# take argument $lockname.
+	#
+	# make sure $run_dir/$lockname.lock actually belongs to me (contains my pid and mutex)
+	# and remove it if it does, die if it doesn't.
+
+	my $lockname = shift;
+	my $lockfile = "$run_dir/$lockname.lock";
+
+	if (checklock($lockname) == 2) {
+		unlink $lockfile;
+		return;
+	} elsif (checklock($lockname) == 1) {
+		die "ERROR: No valid lockfile found - Did a rogue process or user update or delete it?\n";
+	} else {
+		die "ERROR: A valid lockfile exists but does not belong to me! I refuse to remove it.\n";
+	}
+}
+
+sub writelock {
+	# take argument $lockname.
+	#
+	# write a lockfile to $run_dir/$lockname.lock with first line
+	# being my pid and second line being my mutex.
+
+	my $lockname = shift;
+	my $lockfile = "$run_dir/$lockname.lock";
+
+	# die honorably rather than overwriting a valid, existing lock
+	if (! checklock($lockname)) {
+		die "ERROR: Valid lock already exists - I refuse to overwrite it. Committing seppuku now.\n";
+	}
+
+	my $pid = $$;
+
+	open PL, "$ps -p $$ -o args= |";
+	my @processlist = <PL>;
+	close PL;
+
+	my $mutex = pop(@processlist);
+	chomp $mutex;
+
+	open FH, "> $lockfile";
+	print FH "$pid\n";
+	print FH "$mutex\n";
+	close FH;
+}
+
+sub parse_snapshot_cache {
+	my %snapshots = ();
+
+	if (! (-e $snapshot_cache)) {
+		return %snapshots;
+	}
+
+	my @lines = `cat $snapshot_cache`;
+	foreach my $line (@lines) {
+		chomp $line;
+		$snapshots{$line} = 1;
+	}
+
+	return %snapshots;
+}
+
+sub write_snapshot_cache {
+	my (%snapshots) = @_;
+
+	open FH, "> $snapshot_cache" or die "Couldn't write to $snapshot_cache";
+	print FH join("\n", (keys %snapshots));
+	close FH;
+}

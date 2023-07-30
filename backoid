@@ -606,3 +606,25 @@ sub write_snapshot_cache {
 	print FH join("\n", (keys %snapshots));
 	close FH;
 }
+
+__END__
+
+=head1 NAME
+
+backoid - a sanoid/syncoid-like utility for object storage backup targets
+
+=head1 SYNOPSIS
+
+backoid [options]
+
+Options:
+
+  --configdir=DIR       Specify a directory to find config file backoid.conf
+  --cache-dir=DIR       Specify a directory to store the uploaded snapshots cache
+  --run-dir=DIR         Specify a directory for temporary files such as lock files
+
+  --verbose             Prints out additional information during a backoid run
+  --debug               Prints out a lot of additional information during a backoid run
+
+  --help                Prints this helptext
+  --version             Prints the version number

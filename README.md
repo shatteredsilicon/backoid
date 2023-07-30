@@ -206,6 +206,14 @@ And the definition for each option is:
 
     When the suffix is empty, it means to keep only the **X** most recent snapshots that matches the pattern.
 
++	compressor_options
+
+	options that will be passed directly to the compressor program. e.g. `compressor_options = --threads=24`
+
++	rclone_options
+
+	options that will be passed directly to the rclone program during the upload. e.g. `rclone_options = --buffer-size=32M`
+
 And below are the available command line arguments:
 
 +   --configdir

@@ -374,16 +374,19 @@ sub upload_dataset {
 		my $snapshot_name = basename($snapshot_filepath);
 		my $remote_path = catfile($dataset{'target'}, $snapshot_name);
 
+		my ($snapshot_size) = `du -s --apparent-size $snapshot_filepath` =~ /^\s*(\w+)\s+/;
+		$snapshot_size *= 1024; # du returns size in KB
+
 		my $verbose_arg = '';
 		my $pv_cmd = '';
 		if ($verbose) {
 			$verbose_arg = '-v';
-			my ($snapshot_size) = `du -s --apparent-size $snapshot_filepath` =~ /^\s*(\w+)\s+/;
-			$snapshot_size *= 1024; # du returns size in KB
 			$pv_cmd = "| $pv --name $snapshot->{'name'} -s $snapshot_size";
 		}
 
-		$cmd = "tar cf - -C $snapshot_dir $snapshot_name |  mbuffer -q -Q -s 128K -m 16M $pv_cmd | $compressor{'bin'} $compressor{'level'} - | $rclone $verbose_arg rcat $remote_path.tar.$compressor{'extension'}";
+		my $compressor_cmd = gen_compressor_cmd(%compressor, $snapshot_size);
+
+		$cmd = "tar cf - -C $snapshot_dir $snapshot_name |  mbuffer -q -Q -s 128K -m 16M $pv_cmd | $compressor_cmd | $rclone $verbose_arg rcat $remote_path.tar.$compressor{'extension'}";
 		if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot->{'name'} with command '$cmd' ...\n"; }
 		system("$cmd") == 0 or do {
 			warn "CRITICAL ERROR: taring up and uploading snapshot $snapshot->{'name'} failed";
@@ -462,6 +465,17 @@ sub get_compressor {
 	}
 
 	return %compressor;
+}
+
+sub gen_compressor_cmd {
+	my (%compressor, $snapshot_size) = @_;
+	my $cmd = "$compressor{'bin'} $compressor{'level'}";
+
+	if ($compressor{'extension'} eq 'zst') {
+		$cmd = "$cmd --size-hint=$snapshot_size"
+	}
+
+	return "$cmd -";
 }
 
 sub checklock {

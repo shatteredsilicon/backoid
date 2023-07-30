@@ -326,7 +326,7 @@ sub get_zfs_datasets {
 sub get_snapshots {
 	my $path = shift;
 
-	my $cmd = "$zfs list -o name -t snapshot -H $path 2>&1";
+	my $cmd = "$zfs list -o name -t snapshot -S creation -H $path 2>&1";
 	 if ($debug) { print "DEBUG: getting list of snapshots of $path using '$cmd' ...\n"; }
 	my @snapshots = `$cmd`;
 	my $exit_code = $? >> 8;

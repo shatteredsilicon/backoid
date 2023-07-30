@@ -370,7 +370,8 @@ sub upload_dataset {
 		my $pv_cmd = '';
 		if ($verbose) {
 			$verbose_arg = '-v';
-			my ($snapshot_size) = `du -hs --apparent-size $snapshot_filepath` =~ /^\s*(\w+)\s+/;
+			my ($snapshot_size) = `du -s --apparent-size $snapshot_filepath` =~ /^\s*(\w+)\s+/;
+			$snapshot_size *= 1024; # du returns size in KB
 			$pv_cmd = "| $pv --name $snapshot_filepath -s $snapshot_size";
 		}
 

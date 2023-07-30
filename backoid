@@ -72,7 +72,9 @@ sub upload_snapshots {
 
 		my @present_snapshots = ();
 		foreach my $dataset (keys %{$config{'datasets'}}) {
-			push(@present_snapshots, @{$config{'datasets'}{$dataset}{'snapshots'}});
+			foreach my $snapshot (@{$config{'datasets'}{$dataset}{'snapshots'}}) {
+				push(@present_snapshots, $snapshot->{'name'});
+			}
 			upload_dataset(%{$config{'datasets'}{$dataset}});
 		}
 
@@ -261,6 +263,7 @@ sub parse_config {
 		foreach my $snapshot (@snapshots) {
 			chomp $snapshot;
 			my $trim_snapshot = $snapshot;
+			my $snapshot_path = '';
 			$trim_snapshot =~ s/^$dataset@//;
 
 			if (! ($trim_snapshot =~ /$config{'datasets'}{$dataset}{'pattern'}/)) {
@@ -268,11 +271,15 @@ sub parse_config {
 			}
 
 			if ($config{'datasets'}{$dataset}{'mountpoint'} ne "") {
-				$snapshot = catfile($config{'datasets'}{$dataset}{'mountpoint'}, ".zfs", "snapshot", "$trim_snapshot");
+				$snapshot_path = catfile($config{'datasets'}{$dataset}{'mountpoint'}, ".zfs", "snapshot", "$trim_snapshot");
 			}
 
 			if ($debug) { print "DEBUG: found snapshot $snapshot\n"; }
-			push(@{$config{'datasets'}{$dataset}{'snapshots'}}, $snapshot);
+			my %snapshot_obj = (
+				'name' => "$snapshot",
+				'path' => "$snapshot_path"
+			);
+			push(@{$config{'datasets'}{$dataset}{'snapshots'}}, \%snapshot_obj);
 		}
 	}
 
@@ -337,25 +344,25 @@ sub upload_dataset {
 	my %compressor = get_compressor($dataset{'compression'}, $dataset{'compression_level'});
 
 	foreach my $snapshot (@{$dataset{'snapshots'}}) {
-		if (grep $snapshot eq $_, (keys %cached_snapshots)) {
+		if (grep $snapshot->{'name'} eq $_, (keys %cached_snapshots)) {
 			# same snapshots were uploaded, ignore
-			if ($verbose) { print "INFO: deferring snapshot uploading - snapshot $snapshot already uploaded.\n"; }
+			if ($verbose) { print "INFO: deferring snapshot uploading - snapshot $snapshot->{'name'} already uploaded.\n"; }
 			next;
 		}
 
 		my $file_arg = '';
 		my $cmd = '';
 		my $snapshot_filepath = '';
-		if (-e $snapshot) {
-			$snapshot_filepath = $snapshot;
+		if (-e "$snapshot->{'path'}") {
+			$snapshot_filepath = $snapshot->{'path'};
 		} else {
-			my $replace_snapshot = $snapshot;
+			my $replace_snapshot = $snapshot->{'name'};
 			$replace_snapshot =~ s#@#/#;
 			$snapshot_filepath = catfile($tmp_dir, $replace_snapshot);
 			make_path(dirname($snapshot_filepath));
 
-			$cmd = "$zfs send $snapshot > $snapshot_filepath";
-			if ($debug) { print "DEBUG: dumping snapshot $snapshot to $snapshot_filepath\n"; }
+			$cmd = "$zfs send $snapshot->{'name'} > $snapshot_filepath";
+			if ($debug) { print "DEBUG: dumping snapshot $snapshot->{'name'} to $snapshot_filepath\n"; }
 			system("$cmd") == 0 or do {
 				warn "CRITICAL ERROR: command '$cmd' failed";
 				return;
@@ -372,17 +379,17 @@ sub upload_dataset {
 			$verbose_arg = '-v';
 			my ($snapshot_size) = `du -s --apparent-size $snapshot_filepath` =~ /^\s*(\w+)\s+/;
 			$snapshot_size *= 1024; # du returns size in KB
-			$pv_cmd = "| $pv --name $snapshot_filepath -s $snapshot_size";
+			$pv_cmd = "| $pv --name $snapshot->{'name'} -s $snapshot_size";
 		}
 
 		$cmd = "tar cf - -C $snapshot_dir $snapshot_name $pv_cmd | $compressor{'bin'} $compressor{'level'} - | $rclone $verbose_arg rcat $remote_path.tar.$compressor{'extension'}";
-		if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot with command '$cmd' ...\n"; }
+		if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot->{'name'} with command '$cmd' ...\n"; }
 		system("$cmd") == 0 or do {
-			warn "CRITICAL ERROR: taring up and uploading snapshot $snapshot failed";
+			warn "CRITICAL ERROR: taring up and uploading snapshot $snapshot->{'name'} failed";
 			return;
 		};
 
-		$cached_snapshots{$snapshot} = 1;
+		$cached_snapshots{$snapshot->{'name'}} = 1;
 	}
 }
 

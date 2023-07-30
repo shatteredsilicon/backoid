@@ -24,6 +24,7 @@ my $pv = 'pv';
 my $zfs = 'zfs';
 my $tar = 'tar';
 my $rclone = 'rclone';
+my $mbuffer = 'mbuffer';
 
 my $DEFAULT_COMPRESSION = 'zstd';
 my $DEFAULT_RETENTION = '7d';
@@ -382,7 +383,7 @@ sub upload_dataset {
 			$pv_cmd = "| $pv --name $snapshot->{'name'} -s $snapshot_size";
 		}
 
-		$cmd = "tar cf - -C $snapshot_dir $snapshot_name $pv_cmd | $compressor{'bin'} $compressor{'level'} - | $rclone $verbose_arg rcat $remote_path.tar.$compressor{'extension'}";
+		$cmd = "tar cf - -C $snapshot_dir $snapshot_name |  mbuffer -q -Q -s 128K -m 16M $pv_cmd | $compressor{'bin'} $compressor{'level'} - | $rclone $verbose_arg rcat $remote_path.tar.$compressor{'extension'}";
 		if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot->{'name'} with command '$cmd' ...\n"; }
 		system("$cmd") == 0 or do {
 			warn "CRITICAL ERROR: taring up and uploading snapshot $snapshot->{'name'} failed";

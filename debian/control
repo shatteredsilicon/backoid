@@ -14,6 +14,7 @@ Depends: libcapture-tiny-perl,
          libconfig-inifiles-perl,
          zfsutils-linux | zfs,
          rclone,
+         mbuffer,
          ${misc:Depends},
          ${perl:Depends}
 Recommends: gzip,

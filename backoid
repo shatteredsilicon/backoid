@@ -384,7 +384,7 @@ sub upload_dataset {
 			$pv_cmd = "| $pv --name $snapshot->{'name'} -s $snapshot_size";
 		}
 
-		my $compressor_cmd = gen_compressor_cmd(%compressor, $snapshot_size, $dataset{'compressor_options'});
+		my $compressor_cmd = gen_compressor_cmd(\%compressor, $snapshot_size, $dataset{'compressor_options'});
 
 		$cmd = "tar cf - -C $snapshot_dir $snapshot_name |  mbuffer -q -Q -s 128K -m 16M $pv_cmd | $compressor_cmd | $rclone $verbose_arg $dataset{'rclone_options'} rcat $remote_path.tar.$compressor{'extension'}";
 		if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot->{'name'} with command '$cmd' ...\n"; }
@@ -468,11 +468,10 @@ sub get_compressor {
 }
 
 sub gen_compressor_cmd {
-	my (%compressor, $snapshot_size, $compressor_options) = @_;
-	$compressor_options //= '';
-	my $cmd = "$compressor{'bin'} $compressor{'level'} $compressor_options";
+	my ($compressor, $snapshot_size, $compressor_options) = @_;
+	my $cmd = "$compressor->{'bin'} $compressor->{'level'} $compressor_options";
 
-	if ($compressor{'extension'} eq 'zst') {
+	if ($compressor->{'extension'} eq 'zst') {
 		$cmd = "$cmd --size-hint=$snapshot_size"
 	}
 

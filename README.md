@@ -220,10 +220,6 @@ And below are the available command line arguments:
 
 	Specify a location for the config file named backoid.conf. Defaults to /etc/backoid
 
-+   --cache-dir
-
-	Specify a directory to store the zfs snapshot cache. Defaults to /var/cache/backoid
-
 +   --run-dir
 
 	Specify a directory for temporary files such as lock files. Defaults to /var/run/backoid

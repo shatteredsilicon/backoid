@@ -31,10 +31,9 @@ my $DEFAULT_RETENTION = '7d';
 
 my %args = (
     "configdir" => "/etc/backoid",
-	"cache-dir" => "/var/cache/backoid",
 	"run-dir" => "/var/run/backoid"
 );
-GetOptions(\%args, "configdir=s", "cache-dir=s", "run-dir=s", "debug", "verbose") or pod2usage;
+GetOptions(\%args, "configdir=s", "run-dir=s", "debug", "verbose") or pod2usage;
 
 my $conf_file = "$args{'configdir'}/backoid.conf";
 my $default_conf_file = "$args{'configdir'}/backoid.defaults.conf";
@@ -42,14 +41,11 @@ my $default_conf_file = "$args{'configdir'}/backoid.defaults.conf";
 my $debug = $args{'debug'};
 my $verbose = $args{'verbose'};
 
-my $cache_dir = $args{'cache-dir'};
 my $run_dir = $args{'run-dir'};
 my $tmp_dir = "/tmp/backoid";
 
-make_path($cache_dir);
 make_path($run_dir);
 
-my $snapshot_cache = "$cache_dir/snapshots.txt";
 my $object_ttl = 2592000; # in seconds, 30 days
 
 if (scalar(@ARGV) != 0) {
@@ -59,7 +55,6 @@ if (scalar(@ARGV) != 0) {
 
 my $sourceisroot = 0 + ($< == 0);
 my %config = parse_config($conf_file, $default_conf_file);
-my %cached_snapshots = parse_snapshot_cache();
 
 upload_snapshots();
 purge_snapshots();
@@ -67,33 +62,20 @@ purge_snapshots();
 sub upload_snapshots {
 	if (checklock('backoid_uploading')) {
 		writelock('backoid_uploading');
+
 		if (! (-d $tmp_dir)) {
 			make_path($tmp_dir) or die "couldn't create temporary directory $tmp_dir";
 		}
 
-		my @present_snapshots = ();
+		my %uploaded_snapshots = get_uploaded_snapshots();
 		foreach my $dataset (keys %{$config{'datasets'}}) {
-			foreach my $snapshot (@{$config{'datasets'}{$dataset}{'snapshots'}}) {
-				push(@present_snapshots, $snapshot->{'name'});
-			}
-			upload_dataset(%{$config{'datasets'}{$dataset}});
+			upload_dataset(\%{$config{'datasets'}{$dataset}}, \%uploaded_snapshots);
 		}
 
 		if (-d $tmp_dir) {
 			rmtree($tmp_dir) or warn "ERROR: couldn't delete temporary directory $tmp_dir";
 		}
 
-		# remove snapshots from cached that is not present.
-		foreach my $snapshot (keys %cached_snapshots) {
-			if (grep $snapshot eq $_, @present_snapshots) {
-				next;
-			}
-
-			if ($debug) { print "DEBUG: deleting cached snapshot $snapshot ...\n"; }
-			delete $cached_snapshots{$snapshot};
-		}
-
-		write_snapshot_cache(%cached_snapshots);
 		removelock('backoid_uploading');
 	} else {
 		if ($verbose) { print "INFO: deferring snapshot uploading - valid uploading lock held by other backoid process.\n"; }
@@ -101,79 +83,81 @@ sub upload_snapshots {
 }
 
 sub purge_snapshots {
-	foreach my $dataset (keys %{$config{'datasets'}}) {
-		my ($retention_number, $retention_suffix) = ($config{'datasets'}{$dataset}{'retention'} =~ /^(\d+)([hdwmy]?)$/);
-		if (! length($retention_number) && ! length($retention_suffix)) {
-			warn "CRITICAL ERROR: auto purge for dataset '$dataset' is cancelled, backoid doesn't know how to deal with retention '$config{'datasets'}{$dataset}{'retention'}'";
-			next;
-		}
+	if (checklock('backoid_purging')) {
+		writelock('backoid_purging');
 
-		# object list is ordered by modification,ascending
-		my @lines = `$rclone lsl --max-depth 1 $config{'datasets'}{$dataset}{'target'}`;
-		my @purging_objects = ();
-		foreach my $line (@lines) {
-			my ($size, $year, $month, $day, $hour, $minute, $second, $object) = $line =~ /^\s*(\d+)\s+(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.\d+\s+([^\s]+)/;
-			if (! length($object)) {
-				warn "CRITICAL ERROR: get unexpected line from rclone lsl output -> '$line'";
+		my %uploaded_snapshots = get_uploaded_snapshots();
+		foreach my $dataset (keys %{$config{'datasets'}}) {
+			my ($retention_number, $retention_suffix) = ($config{'datasets'}{$dataset}{'retention'} =~ /^(\d+)([hdwmy]?)$/);
+			if (! length($retention_number) && ! length($retention_suffix)) {
+				warn "CRITICAL ERROR: auto purge for dataset '$dataset' is cancelled, backoid doesn't know how to deal with retention '$config{'datasets'}{$dataset}{'retention'}'";
 				next;
 			}
 
-			my $trim_object = $object;
-			$trim_object =~ s/\.tar\.\w+$//;
-			if (! ($trim_object =~ /$config{'datasets'}{$dataset}{'pattern'}/)) {
-				next;
-			}
-
-			# auto purge by keeping certain amount of most recent snapshot tarballs,
-			# no need to check if the snapshot tarball is expired.
-			if ($retention_suffix eq '') {
-				my $datetime = "$year-$month-$day $hour:$minute:$second";
-				my $i = 0;
-				foreach my $purging_object (@purging_objects) {
-					if ($purging_object->{'datetime'} gt $datetime) {
-						last;
-					}
-
-					$i = $i + 1;
+			my @purging_objects = ();
+			foreach my $snapshot (keys %uploaded_snapshots) {
+				if (! ($snapshot =~ /^$dataset@/)) {
+					# not the snapshot of current dataset
+					next;
 				}
-				splice(@purging_objects, $i, 0, {
-					'datetime' => $datetime,
-					'object' => $object
-				});
-				next;
-			}
 
-			my $seconds = 60 * 60;
-			if ($retention_suffix eq 'h') {
-				$seconds = $seconds * $retention_number;
-			} elsif ($retention_suffix eq 'd') {
-				$seconds = $seconds * 24 * $retention_number;
-			} elsif ($retention_suffix eq 'w') {
-				$seconds = $seconds * 24 * 7 * $retention_number;
-			} elsif ($retention_suffix eq 'm') {
-				$seconds = $seconds * 24 * 30 * $retention_number;
-			} else { # year
-				$seconds = $seconds * 24 * 365 * $retention_number;
-			}
+				my %snapshot_obj = %{$uploaded_snapshots{$snapshot}};
 
-			if (time() - timelocal($second,$minute,$hour,$day,$month-1,$year) < $seconds) {
-				next;
-			}
+				# auto purge by keeping certain amount of most recent snapshot tarballs,
+				# no need to check if the snapshot tarball is expired.
+				if ($retention_suffix eq '') {
+					my $datetime = "$snapshot_obj{'year'}-$snapshot_obj{'month'}-$snapshot_obj{'day'} $snapshot_obj{'hour'}:$snapshot_obj{'minute'}:$snapshot_obj{'second'}";
+					my $i = 0;
+					foreach my $purging_object (@purging_objects) {
+						if ($purging_object->{'datetime'} gt $datetime) {
+							last;
+						}
 
-			my $object_path = catfile($config{'datasets'}{$dataset}{'target'}, $object);
-			if ($debug) { print "DEBUG: found expired object $object_path\n"; }
-			system("$rclone deletefile $object_path") == 0
-				or warn "CRITICAL ERROR: purge object $object_path failed, exit code: $?";
-		}
+						$i = $i + 1;
+					}
+					splice(@purging_objects, $i, 0, {
+						'datetime' => $datetime,
+						'object' => $snapshot_obj{'object'}
+					});
+					next;
+				}
 
-		if (scalar(@purging_objects) > 0 && scalar(@purging_objects) > $retention_number) {
-			for my $index (0 .. (scalar(@purging_objects) - $retention_number - 1)) {
-				my $object_path = catfile($config{'datasets'}{$dataset}{'target'}, $purging_objects[$index]->{'object'});
-				if ($debug) { print "DEBUG: purging object $object_path\n"; }
+				my $seconds = 60 * 60;
+				if ($retention_suffix eq 'h') {
+					$seconds = $seconds * $retention_number;
+				} elsif ($retention_suffix eq 'd') {
+					$seconds = $seconds * 24 * $retention_number;
+				} elsif ($retention_suffix eq 'w') {
+					$seconds = $seconds * 24 * 7 * $retention_number;
+				} elsif ($retention_suffix eq 'm') {
+					$seconds = $seconds * 24 * 30 * $retention_number;
+				} else { # year
+					$seconds = $seconds * 24 * 365 * $retention_number;
+				}
+
+				if (time() - timelocal($snapshot_obj{'second'},$snapshot_obj{'minute'},$snapshot_obj{'hour'},$snapshot_obj{'day'},$snapshot_obj{'month'}-1,$snapshot_obj{'year'}) < $seconds) {
+					next;
+				}
+
+				my $object_path = catfile($config{'datasets'}{$dataset}{'target'}, $snapshot_obj{'object'});
+				if ($debug) { print "DEBUG: found expired object $object_path\n"; }
 				system("$rclone deletefile $object_path") == 0
 					or warn "CRITICAL ERROR: purge object $object_path failed, exit code: $?";
 			}
+
+			if (scalar(@purging_objects) > 0 && scalar(@purging_objects) > $retention_number) {
+				for my $index (0 .. (scalar(@purging_objects) - $retention_number - 1)) {
+					my $object_path = catfile($config{'datasets'}{$dataset}{'target'}, $purging_objects[$index]->{'object'});
+					if ($debug) { print "DEBUG: purging object $object_path\n"; }
+					system("$rclone deletefile $object_path") == 0
+						or warn "CRITICAL ERROR: purge object $object_path failed, exit code: $?";
+				}
+			}
 		}
+
+		removelock('backoid_purging');
+	} else {
+		if ($verbose) { print "INFO: deferring snapshot purging - valid purging lock held by other backoid process.\n"; }
 	}
 }
 
@@ -249,10 +233,7 @@ sub parse_config {
 			$config{'datasets'}{$section}{'retention'} = $DEFAULT_RETENTION;
 		}
 
-		# section path is the section name
-		$config{'datasets'}{$section}{'path'} = $section;
-
-		my @zfs_datasets = get_zfs_datasets($config{'datasets'}{$section}{'path'}, 0);
+		my @zfs_datasets = get_zfs_datasets($section, 0);
 		my $zfs_dataset = shift @zfs_datasets;
 		$config{'datasets'}{$section}{'mountpoint'} = $zfs_dataset->{'mountpoint'};
 	}
@@ -260,7 +241,7 @@ sub parse_config {
 	foreach my $dataset (keys %{$config{'datasets'}}) {
 		$config{'datasets'}{$dataset}{'snapshots'} = [];
 
-		my @snapshots = get_snapshots($config{'datasets'}{$dataset}{'path'});
+		my @snapshots = get_snapshots($dataset);
 		foreach my $snapshot (@snapshots) {
 			chomp $snapshot;
 			my $trim_snapshot = $snapshot;
@@ -341,12 +322,12 @@ sub get_snapshots {
 }
 
 sub upload_dataset {
-	my (%dataset) = @_;
-	my %compressor = get_compressor($dataset{'compression'}, $dataset{'compression_level'});
+	my ($dataset, $uploaded_snapshots) = @_;
+	my %compressor = get_compressor($dataset->{'compression'}, $dataset->{'compression_level'});
 
-	foreach my $snapshot (@{$dataset{'snapshots'}}) {
-		if (grep $snapshot->{'name'} eq $_, (keys %cached_snapshots)) {
-			# same snapshots were uploaded, ignore
+	foreach my $snapshot (@{$dataset->{'snapshots'}}) {
+		if (defined $uploaded_snapshots->{$snapshot->{'name'}}) {
+			# same snapshot is uploaded, ignore
 			if ($verbose) { print "INFO: deferring snapshot uploading - snapshot $snapshot->{'name'} already uploaded.\n"; }
 			next;
 		}
@@ -372,7 +353,7 @@ sub upload_dataset {
 
 		my $snapshot_dir = dirname($snapshot_filepath);
 		my $snapshot_name = basename($snapshot_filepath);
-		my $remote_path = catfile($dataset{'target'}, $snapshot_name);
+		my $remote_path = catfile($dataset->{'target'}, $snapshot_name);
 
 		my ($snapshot_size) = `du -s --apparent-size $snapshot_filepath` =~ /^\s*(\w+)\s+/;
 		$snapshot_size *= 1024; # du returns size in KB
@@ -384,16 +365,22 @@ sub upload_dataset {
 			$pv_cmd = "| $pv --name $snapshot->{'name'} -s $snapshot_size";
 		}
 
-		my $compressor_cmd = gen_compressor_cmd(\%compressor, $snapshot_size, $dataset{'compressor_options'});
+		my $compressor_cmd = gen_compressor_cmd(\%compressor, $snapshot_size, $dataset->{'compressor_options'});
 
-		$cmd = "tar cf - -C $snapshot_dir $snapshot_name |  mbuffer -q -Q -s 128K -m 16M $pv_cmd | $compressor_cmd | $rclone $verbose_arg $dataset{'rclone_options'} rcat $remote_path.tar.$compressor{'extension'}";
+		my $check_cmd = "$rclone ls $dataset->{'target'} --include $snapshot_name.tar.*";
+		if ($debug) { print "DEBUG: checking if snapshot $snapshot->{'name'} exists on remote with command '$check_cmd' ...\n"; }
+		my $check_output = `$check_cmd`;
+		if ($check_output ne '') {
+			if ($verbose) { print "INFO: deferring snapshot uploading - snapshot $snapshot->{'name'} already exists on remote.\n"; }
+			next;
+		}
+
+		$cmd = "tar cf - -C $snapshot_dir $snapshot_name |  mbuffer -q -Q -s 128K -m 16M $pv_cmd | $compressor_cmd | $rclone $verbose_arg $dataset->{'rclone_options'} rcat $remote_path.tar.$compressor{'extension'}";
 		if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot->{'name'} with command '$cmd' ...\n"; }
 		system("$cmd") == 0 or do {
 			warn "CRITICAL ERROR: taring up and uploading snapshot $snapshot->{'name'} failed";
 			return;
 		};
-
-		$cached_snapshots{$snapshot->{'name'}} = 1;
 	}
 }
 
@@ -598,28 +585,38 @@ sub writelock {
 	close FH;
 }
 
-sub parse_snapshot_cache {
+sub get_uploaded_snapshots {
 	my %snapshots = ();
 
-	if (! (-e $snapshot_cache)) {
-		return %snapshots;
-	}
+	foreach my $dataset (keys %{$config{'datasets'}}) {
+		my @lines = `$rclone lsl --max-depth 1 $config{'datasets'}{$dataset}{'target'}`;
+		foreach my $line (@lines) {
+			my ($size, $year, $month, $day, $hour, $minute, $second, $object) = $line =~ /^\s*(\d+)\s+(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.\d+\s+([^\s]+)/;
+			if (! length($object)) {
+				warn "CRITICAL ERROR: get unexpected line from rclone lsl output -> '$line'";
+				next;
+			}
 
-	my @lines = `cat $snapshot_cache`;
-	foreach my $line (@lines) {
-		chomp $line;
-		$snapshots{$line} = 1;
+			my $trim_object = $object;
+			$trim_object =~ s/\.tar\.\w+$//;
+			if (! ($trim_object =~ /$config{'datasets'}{$dataset}{'pattern'}/)) {
+				next;
+			}
+
+			my $name = "$dataset\@$trim_object";
+			$snapshots{$name} = {
+				'year' => $year,
+				'month'=> $month,
+				'day' => $day,
+				'hour' => $hour,
+				'minute' => $minute,
+				'second' => $second,
+				'object' => $object
+			}
+		}
 	}
 
 	return %snapshots;
-}
-
-sub write_snapshot_cache {
-	my (%snapshots) = @_;
-
-	open FH, "> $snapshot_cache" or die "Couldn't write to $snapshot_cache";
-	print FH join("\n", (keys %snapshots));
-	close FH;
 }
 
 __END__
@@ -635,7 +632,6 @@ backoid [options]
 Options:
 
   --configdir=DIR       Specify a directory to find config file backoid.conf
-  --cache-dir=DIR       Specify a directory to store the uploaded snapshots cache
   --run-dir=DIR         Specify a directory for temporary files such as lock files
 
   --verbose             Prints out additional information during a backoid run

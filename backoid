@@ -122,18 +122,7 @@ sub purge_snapshots {
 					next;
 				}
 
-				my $seconds = 60 * 60;
-				if ($retention_suffix eq 'h') {
-					$seconds = $seconds * $retention_number;
-				} elsif ($retention_suffix eq 'd') {
-					$seconds = $seconds * 24 * $retention_number;
-				} elsif ($retention_suffix eq 'w') {
-					$seconds = $seconds * 24 * 7 * $retention_number;
-				} elsif ($retention_suffix eq 'm') {
-					$seconds = $seconds * 24 * 30 * $retention_number;
-				} else { # year
-					$seconds = $seconds * 24 * 365 * $retention_number;
-				}
+				my $seconds = retention_to_seconds($retention_number, $retention_suffix);
 
 				if (time() - timelocal($snapshot_obj{'second'},$snapshot_obj{'minute'},$snapshot_obj{'hour'},$snapshot_obj{'day'},$snapshot_obj{'month'}-1,$snapshot_obj{'year'}) < $seconds) {
 					next;
@@ -219,9 +208,9 @@ sub parse_config {
 		}
 
 		# override with any locally set values in the module itself
-        foreach my $key (keys %{$ini{$section}}) {
-            $config{'datasets'}{$section}{$key} = $ini{$section}{$key};
-        }
+		foreach my $key (keys %{$ini{$section}}) {
+			$config{'datasets'}{$section}{$key} = $ini{$section}{$key};
+		}
 
 		# target not defined, which means no upload
 		if (!defined ($config{'datasets'}{$section}{'target'}) || !length ($config{'datasets'}{$section}{'target'})) {
@@ -241,16 +230,10 @@ sub parse_config {
 	foreach my $dataset (keys %{$config{'datasets'}}) {
 		$config{'datasets'}{$dataset}{'snapshots'} = [];
 
-		my @snapshots = get_snapshots($dataset);
+		my @snapshots = get_snapshots($dataset, $config{'datasets'}{$dataset}{'retention'}, $config{'datasets'}{$dataset}{'pattern'});
 		foreach my $snapshot (@snapshots) {
-			chomp $snapshot;
 			my $trim_snapshot = $snapshot;
 			my $snapshot_path = '';
-			$trim_snapshot =~ s/^$dataset@//;
-
-			if (! ($trim_snapshot =~ /$config{'datasets'}{$dataset}{'pattern'}/)) {
-				next;
-			}
 
 			if ($config{'datasets'}{$dataset}{'mountpoint'} ne "") {
 				$snapshot_path = catfile($config{'datasets'}{$dataset}{'mountpoint'}, ".zfs", "snapshot", "$trim_snapshot");
@@ -306,16 +289,52 @@ sub get_zfs_datasets {
 }
 
 sub get_snapshots {
-	my $path = shift;
+	my ($dataset, $retention, $pattern) = @_;
+	my ($retention_number, $retention_suffix) = ($retention =~ /^(\d+)([hdwmy]?)$/);
+	my @snapshots = ();
 
-	my $cmd = "$zfs list -o name -t snapshot -S creation -H $path 2>&1";
-	 if ($debug) { print "DEBUG: getting list of snapshots of $path using '$cmd' ...\n"; }
-	my @snapshots = `$cmd`;
+	my $cmd = "$zfs list -o name,creation -t snapshot -S creation -H -p $dataset 2>&1";
+	 if ($debug) { print "DEBUG: getting list of snapshots of $dataset using '$cmd' ...\n"; }
+	my @lines = `$cmd`;
 	my $exit_code = $? >> 8;
 
 	if ($exit_code != 0) {
 		warn "CRITICAL ERROR: command '$cmd' failed with exit code: $exit_code";
 		return ();
+	}
+
+	my $snapshot_count = 0;
+	my $out_of_retention = 0;
+	foreach my $line (@lines) {
+		chomp $line;
+
+		my ($snapshot, $timestamp) = ($line =~ /^\s*(\S+)\s+(\d+)\s*$/);
+		if (! length($snapshot)) {
+			warn "CRITICAL ERROR: get unexpected line from zfs list output -> '$line'";
+			next;
+		}
+
+		my $trim_snapshot = $snapshot;
+		$trim_snapshot =~ s/^$dataset@//;
+		if (! ($trim_snapshot =~ /$pattern/)) {
+			next;
+		}
+
+		if ($retention_suffix ne '') {
+			my $seconds = retention_to_seconds($retention_number, $retention_suffix);
+			if (time() - $timestamp >= $seconds) {
+				$out_of_retention = 1;
+			}
+		} elsif ($snapshot_count >= $retention_number) {
+			$out_of_retention = 1;
+		}
+
+		if ($out_of_retention) {
+			last;
+		}
+
+		push(@snapshots, $snapshot);
+		$snapshot_count += 1;
 	}
 
 	return @snapshots;
@@ -617,6 +636,25 @@ sub get_uploaded_snapshots {
 	}
 
 	return %snapshots;
+}
+
+sub retention_to_seconds {
+	my ($number, $suffix) = @_;
+
+	my $seconds = 60 * 60;
+	if ($suffix eq 'h') {
+		$seconds = $seconds * $number;
+	} elsif ($suffix eq 'd') {
+		$seconds = $seconds * 24 * $number;
+	} elsif ($suffix eq 'w') {
+		$seconds = $seconds * 24 * 7 * $number;
+	} elsif ($suffix eq 'm') {
+		$seconds = $seconds * 24 * 30 * $number;
+	} else { # year
+		$seconds = $seconds * 24 * 365 * $number;
+	}
+
+	return $seconds;
 }
 
 __END__

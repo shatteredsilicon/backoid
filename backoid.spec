@@ -6,7 +6,7 @@
 
 Name:		   backoid
 Version:	   %{version}
-Release:	   1%{?dist}
+Release:	   1
 BuildArch:	   noarch
 Summary:	   A sanoid/syncoid-like utility for object storage backup targets
 Group:		   Applications/System

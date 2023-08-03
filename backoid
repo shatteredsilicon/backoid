@@ -233,6 +233,7 @@ sub parse_config {
 		my @snapshots = get_snapshots($dataset, $config{'datasets'}{$dataset}{'retention'}, $config{'datasets'}{$dataset}{'pattern'});
 		foreach my $snapshot (@snapshots) {
 			my $trim_snapshot = $snapshot;
+			$trim_snapshot =~ s/^$dataset@//;
 			my $snapshot_path = '';
 
 			if ($config{'datasets'}{$dataset}{'mountpoint'} ne "") {

@@ -1,3 +1,7 @@
+backoid (%{_version}-%{_release}) unstable; urgency=medium
+
+ * Development release
+
 backoid (1.0-1) unstable; urgency=medium
 
   * Initial release

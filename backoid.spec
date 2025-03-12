@@ -1,18 +1,19 @@
-%global version 1.0
-%global git_tag v%{version}
-
 # Enable with systemctl
 %global _with_systemd 1
 
 Name:		   backoid
-Version:	   %{version}
+%if "0%{?_version}" == "0"
+Version:       1.0
+%else
+Version:       %{_version}
+%endif
 Release:	   1
 BuildArch:	   noarch
 Summary:	   A sanoid/syncoid-like utility for object storage backup targets
 Group:		   Applications/System
 License:	   GPLv3
 URL:		   https://github.com/shatteredsilicon/%{name}
-Source0:	   https://github.com/shatteredsilicon/%{name}/archive/%{git_tag}/%{name}-%{version}.tar.gz
+Source0:	   https://github.com/shatteredsilicon/%{name}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 Requires:	   perl, mbuffer, lzop, pv, perl-Config-IniFiles, perl-Capture-Tiny, zstd, rclone, tar, lz4
 %if 0%{?_with_systemd}

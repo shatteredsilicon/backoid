@@ -7,7 +7,11 @@ Version:       1.0
 %else
 Version:       %{_version}
 %endif
+%if "0%{?_release}" == "0"
 Release:	   1
+%else
+Release:	   %{_release}
+%endif
 BuildArch:	   noarch
 Summary:	   A sanoid/syncoid-like utility for object storage backup targets
 Group:		   Applications/System

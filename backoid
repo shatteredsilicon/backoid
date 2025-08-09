@@ -363,8 +363,8 @@ sub upload_dataset {
 			$snapshot_filepath = catfile($tmp_dir, $replace_snapshot);
 			make_path(dirname($snapshot_filepath));
 
-			$cmd = "$zfs send $snapshot->{'name'} > $snapshot_filepath";
-			if ($debug) { print "DEBUG: dumping snapshot $snapshot->{'name'} to $snapshot_filepath\n"; }
+			$cmd = "$zfs send $dataset->{'zfs_send_options'} $snapshot->{'name'} > $snapshot_filepath";
+			if ($debug) { print "DEBUG: dumping snapshot $snapshot->{'name'} to $snapshot_filepath with command '$cmd'\n"; }
 			system("$cmd") == 0 or do {
 				warn "CRITICAL ERROR: command '$cmd' failed";
 				return;

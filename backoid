@@ -480,10 +480,10 @@ sub gen_compressor_cmd {
 	my ($compressor, $snapshot_size, $compressor_options) = @_;
 	my $cmd = "$compressor->{'bin'} $compressor->{'level'} $compressor_options";
 
-	# --size-hint has a value limit, we skip it for now
-	# if ($compressor->{'extension'} eq 'zst') {
-	# 	$cmd = "$cmd --size-hint=$snapshot_size"
-	# }
+	if ($compressor->{'extension'} eq 'zst') {
+		my $size_hint = $snapshot_size < 2**32 ? $snapshot_size : (int($snapshot_size / (2**30) + 0.5) . 'G');
+		$cmd = "$cmd --size-hint=$size_hint";
+	}
 
 	return "$cmd -";
 }

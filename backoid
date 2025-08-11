@@ -343,7 +343,7 @@ sub get_snapshots {
 
 sub upload_dataset {
 	my ($dataset, $uploaded_snapshots) = @_;
-	my %compressor = get_compressor($dataset->{'compression'}, $dataset->{'compression_level'});
+	my $compressor = get_compressor($dataset->{'compression'}, $dataset->{'compression_level'});
 
 	foreach my $snapshot (@{$dataset->{'snapshots'}}) {
 		if (defined $uploaded_snapshots->{$snapshot->{'name'}}) {
@@ -385,7 +385,8 @@ sub upload_dataset {
 			$pv_cmd = "| $pv --name $snapshot->{'name'} -s $snapshot_size";
 		}
 
-		my $compressor_cmd = gen_compressor_cmd(\%compressor, $snapshot_size, $dataset->{'compressor_options'});
+		my $compressor_cmd = defined $compressor ? '| ' . gen_compressor_cmd($compressor, $snapshot_size, $dataset->{'compressor_options'}) : '';
+		my $compression_ext = defined $compressor ? ".tar.$compressor->{'extension'}" : '';
 
 		my $check_cmd = "$rclone ls $dataset->{'target'} --include $snapshot_name.tar.*";
 		if ($debug) { print "DEBUG: checking if snapshot $snapshot->{'name'} exists on remote with command '$check_cmd' ...\n"; }
@@ -395,7 +396,7 @@ sub upload_dataset {
 			next;
 		}
 
-		$cmd = "tar cf - -C $snapshot_dir $snapshot_name |  mbuffer -q -Q -s 128K -m 16M $pv_cmd | $compressor_cmd | $rclone $verbose_arg $dataset->{'rclone_options'} rcat $remote_path.tar.$compressor{'extension'}";
+		$cmd = "tar cf - -C $snapshot_dir $snapshot_name |  mbuffer -q -Q -s 128K -m 16M $pv_cmd $compressor_cmd | $rclone $verbose_arg $dataset->{'rclone_options'} rcat ${remote_path}${compression_ext}";
 		if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot->{'name'} with command '$cmd' ...\n"; }
 		system("$cmd") == 0 or do {
 			warn "CRITICAL ERROR: taring up and uploading snapshot $snapshot->{'name'} failed";
@@ -458,20 +459,21 @@ sub get_compressor {
 			level		=> '',
 			extension	=> 'xz',
 		},
+		'none' => undef
 	);
 
 	if ($compression eq '') {
 		$compression = $DEFAULT_COMPRESSION;
-	} elsif (!(grep $compression eq $_, ('bzip2', 'gzip', 'lz4', 'pbzip2', 'pigz', 'zstd', 'pzstd', 'pxz', 'xz', 'default'))) {
+	} elsif (!(grep $compression eq $_, ((keys %COMPRESS_ARGS), 'default'))) {
 		die "Unrecognised compression type '$compression'";
 	}
 
-	my %compressor = %{$COMPRESS_ARGS{$compression}};
-	if ($level ne '') {
-		$compressor{'level'} = "-$level";
+	my $compressor = $COMPRESS_ARGS{$compression};
+	if (defined $compressor && $level ne '') {
+		$compressor->{'level'} = "-$level";
 	}
 
-	return %compressor;
+	return $compressor;
 }
 
 sub gen_compressor_cmd {

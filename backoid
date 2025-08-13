@@ -355,8 +355,13 @@ sub upload_dataset {
 		my $file_arg = '';
 		my $cmd = '';
 		my $snapshot_filepath = '';
+		my $cleanup_cmd;
 		if (-e "$snapshot->{'path'}") {
 			$snapshot_filepath = $snapshot->{'path'};
+			# When taring up snapshots in the invisible .zfs path finishes,
+			# zfs leaves the path mounted. Therefore we make a cleanup
+			# command to unmount it.
+			$cleanup_cmd = "umount $snapshot_filepath";
 		} else {
 			my $replace_snapshot = $snapshot->{'name'};
 			$replace_snapshot =~ s#@#/#;
@@ -415,7 +420,11 @@ sub upload_dataset {
 
 		$cmd = "tar cf - -C $snapshot_dir $snapshot_name |  mbuffer -q -Q -s 128K -m 16M $pv_cmd $compressor_cmd | $rclone $verbose_arg $dataset->{'rclone_options'} rcat ${remote_path}${compression_ext}";
 		if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot->{'name'} with command '$cmd' ...\n"; }
-		system("$cmd") == 0 or do {
+		my $exit_code = system("$cmd");
+		if (defined $cleanup_cmd) {
+			system("$cleanup_cmd");
+		}
+		if ($exit_code != 0) {
 			warn "CRITICAL ERROR: taring up and uploading snapshot $snapshot->{'name'} failed";
 			return;
 		};

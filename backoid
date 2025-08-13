@@ -363,7 +363,24 @@ sub upload_dataset {
 			$snapshot_filepath = catfile($tmp_dir, $replace_snapshot);
 			make_path(dirname($snapshot_filepath));
 
-			$cmd = "$zfs send $dataset->{'zfs_send_options'} $snapshot->{'name'} > $snapshot_filepath";
+			my $cmd = "$zfs send -nP $snapshot->{'name'}";
+			if ($debug) { print "DEBUG: getting size of snapshot '$snapshot->{'name'}' using '$cmd' ...\n"; }
+			my @lines = `$cmd`;
+			my $exit_code = $? >> 8;
+
+			if ($exit_code != 0) {
+				warn "CRITICAL ERROR: command '$cmd' failed with exit code: $exit_code";
+				return;
+			}
+
+			my @size_fields = split /\s+/, $lines[-1];
+			my $send_snapshot_size = $size_fields[-1];
+			if (!defined $send_snapshot_size || $send_snapshot_size =~ /\D/) {
+				warn "CRITICAL ERROR: got an unexpected return from '$zfs send -cp -nP $snapshot->{'name'}': $send_snapshot_size";
+				return;
+			}
+
+			$cmd = "$zfs send $dataset->{'zfs_send_options'} $snapshot->{'name'} | pv -s $send_snapshot_size > $snapshot_filepath";
 			if ($debug) { print "DEBUG: dumping snapshot $snapshot->{'name'} to $snapshot_filepath with command '$cmd'\n"; }
 			system("$cmd") == 0 or do {
 				warn "CRITICAL ERROR: command '$cmd' failed";

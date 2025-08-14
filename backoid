@@ -418,7 +418,7 @@ sub upload_dataset {
 			next;
 		}
 
-		$cmd = "tar cf - -C $snapshot_dir $snapshot_name |  mbuffer -q -Q -s 128K -m 16M $pv_cmd $compressor_cmd | $rclone $verbose_arg $dataset->{'rclone_options'} rcat ${remote_path}${compression_ext}";
+		$cmd = "tar cf - -C $snapshot_dir $snapshot_name |  mbuffer -q -Q -s 128K -m 16M $pv_cmd $compressor_cmd | $rclone $verbose_arg $dataset->{'rclone_options'} rcat ${remote_path}${compression_ext} && $rclone touch --no-create ${remote_path}${compression_ext}";
 		if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot->{'name'} with command '$cmd' ...\n"; }
 		my $exit_code = system("$cmd");
 		if (defined $cleanup_cmd) {

@@ -42,7 +42,6 @@ my $debug = $args{'debug'};
 my $verbose = $args{'verbose'};
 
 my $run_dir = $args{'run-dir'};
-my $tmp_dir = "/tmp/backoid";
 
 make_path($run_dir);
 
@@ -60,31 +59,23 @@ upload_snapshots();
 purge_snapshots();
 
 sub upload_snapshots {
-	if (checklock('backoid_uploading')) {
-		writelock('backoid_uploading');
-
-		if (! (-d $tmp_dir)) {
-			make_path($tmp_dir) or die "couldn't create temporary directory $tmp_dir";
-		}
+	if (checklock('backoid')) {
+		writelock('backoid');
 
 		my %uploaded_snapshots = get_uploaded_snapshots();
 		foreach my $dataset (keys %{$config{'datasets'}}) {
 			upload_dataset(\%{$config{'datasets'}{$dataset}}, \%uploaded_snapshots);
 		}
 
-		if (-d $tmp_dir) {
-			rmtree($tmp_dir) or warn "ERROR: couldn't delete temporary directory $tmp_dir";
-		}
-
-		removelock('backoid_uploading');
+		removelock('backoid');
 	} else {
 		if ($verbose) { print "INFO: deferring snapshot uploading - valid uploading lock held by other backoid process.\n"; }
 	}
 }
 
 sub purge_snapshots {
-	if (checklock('backoid_purging')) {
-		writelock('backoid_purging');
+	if (checklock('backoid')) {
+		writelock('backoid');
 
 		my %uploaded_snapshots = get_uploaded_snapshots();
 		foreach my $dataset (keys %{$config{'datasets'}}) {
@@ -144,7 +135,7 @@ sub purge_snapshots {
 			}
 		}
 
-		removelock('backoid_purging');
+		removelock('backoid');
 	} else {
 		if ($verbose) { print "INFO: deferring snapshot purging - valid purging lock held by other backoid process.\n"; }
 	}
@@ -354,19 +345,24 @@ sub upload_dataset {
 
 		my $file_arg = '';
 		my $cmd = '';
-		my $snapshot_filepath = '';
+		my $snapshot_name;
+		my $snapshot_size;
+		my $snapshot_cmd;
 		my $cleanup_cmd;
 		if (-e "$snapshot->{'path'}") {
-			$snapshot_filepath = $snapshot->{'path'};
+			my $snapshot_dir = dirname("$snapshot->{'path'}");
+			$snapshot_name = basename("$snapshot->{'path'}");
+			$snapshot_size = (`du -s --apparent-size $snapshot->{'path'}` =~ /^\s*(\w+)\s+/) * 1024; # du returns size in KB
+
+			$snapshot_cmd = "tar cf - -C $snapshot_dir $snapshot_name";
 			# When taring up snapshots in the invisible .zfs path finishes,
 			# zfs leaves the path mounted. Therefore we make a cleanup
 			# command to unmount it.
-			$cleanup_cmd = "umount $snapshot_filepath";
+			$cleanup_cmd = "umount $snapshot->{'path'}";
 		} else {
-			my $replace_snapshot = $snapshot->{'name'};
-			$replace_snapshot =~ s#@#/#;
-			$snapshot_filepath = catfile($tmp_dir, $replace_snapshot);
-			make_path(dirname($snapshot_filepath));
+			$snapshot_name = $snapshot->{'name'};
+			$snapshot_name =~ s#@#/#;
+			$snapshot_name = basename($snapshot_name);
 
 			my $cmd = "$zfs send -nP $snapshot->{'name'}";
 			if ($debug) { print "DEBUG: getting size of snapshot '$snapshot->{'name'}' using '$cmd' ...\n"; }
@@ -379,26 +375,16 @@ sub upload_dataset {
 			}
 
 			my @size_fields = split /\s+/, $lines[-1];
-			my $send_snapshot_size = $size_fields[-1];
-			if (!defined $send_snapshot_size || $send_snapshot_size =~ /\D/) {
-				warn "CRITICAL ERROR: got an unexpected return from '$zfs send -cp -nP $snapshot->{'name'}': $send_snapshot_size";
+			$snapshot_size = $size_fields[-1];
+			if (!defined $snapshot_size || $snapshot_size =~ /\D/) {
+				warn "CRITICAL ERROR: got an unexpected return from '$zfs send -cp -nP $snapshot->{'name'}': $snapshot_size";
 				return;
 			}
 
-			$cmd = "$zfs send $dataset->{'zfs_send_options'} $snapshot->{'name'} | pv -s $send_snapshot_size > $snapshot_filepath";
-			if ($debug) { print "DEBUG: dumping snapshot $snapshot->{'name'} to $snapshot_filepath with command '$cmd'\n"; }
-			system("$cmd") == 0 or do {
-				warn "CRITICAL ERROR: command '$cmd' failed";
-				return;
-			};
+			$snapshot_cmd = "$zfs send $dataset->{'zfs_send_options'} $snapshot->{'name'}";
 		}
 
-		my $snapshot_dir = dirname($snapshot_filepath);
-		my $snapshot_name = basename($snapshot_filepath);
 		my $remote_path = catfile($dataset->{'target'}, $snapshot_name);
-
-		my ($snapshot_size) = `du -s --apparent-size $snapshot_filepath` =~ /^\s*(\w+)\s+/;
-		$snapshot_size *= 1024; # du returns size in KB
 
 		my $verbose_arg = '';
 		my $pv_cmd = '';
@@ -418,7 +404,7 @@ sub upload_dataset {
 			next;
 		}
 
-		$cmd = "tar cf - -C $snapshot_dir $snapshot_name |  mbuffer -q -Q -s 128K -m 16M $pv_cmd $compressor_cmd | $rclone $verbose_arg $dataset->{'rclone_options'} rcat ${remote_path}${compression_ext}";
+		$cmd = "$snapshot_cmd | mbuffer -q -Q -s 128K -m 16M $pv_cmd $compressor_cmd | $rclone $verbose_arg $dataset->{'rclone_options'} rcat ${remote_path}${compression_ext} && $rclone touch --no-create ${remote_path}${compression_ext}";
 		if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot->{'name'} with command '$cmd' ...\n"; }
 		my $exit_code = system("$cmd");
 		if (defined $cleanup_cmd) {

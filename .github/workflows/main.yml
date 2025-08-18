@@ -88,12 +88,12 @@ jobs:
 
     steps:
       - name: Download rpm artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: backoid-rpm-artifact
 
       - name: Download deb artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: backoid-deb-artifact
 

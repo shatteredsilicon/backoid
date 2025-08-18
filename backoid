@@ -18,6 +18,7 @@ use File::Spec::Functions 'catfile';
 use File::Basename;
 use File::Path qw(make_path rmtree);
 use Digest::SHA qw(sha256_hex);
+use POSIX qw(ceil);
 
 my $ps = 'ps';
 my $pv = 'pv';
@@ -62,9 +63,10 @@ sub upload_snapshots {
 	if (checklock('backoid')) {
 		writelock('backoid');
 
+		my %remotes = get_remotes();
 		my %uploaded_snapshots = get_uploaded_snapshots();
 		foreach my $dataset (keys %{$config{'datasets'}}) {
-			upload_dataset(\%{$config{'datasets'}{$dataset}}, \%uploaded_snapshots);
+			upload_dataset(\%{$config{'datasets'}{$dataset}}, \%uploaded_snapshots, \%remotes);
 		}
 
 		removelock('backoid');
@@ -333,7 +335,7 @@ sub get_snapshots {
 }
 
 sub upload_dataset {
-	my ($dataset, $uploaded_snapshots) = @_;
+	my ($dataset, $uploaded_snapshots, $remotes) = @_;
 	my $compressor = get_compressor($dataset->{'compression'}, $dataset->{'compression_level'});
 
 	foreach my $snapshot (@{$dataset->{'snapshots'}}) {
@@ -404,7 +406,24 @@ sub upload_dataset {
 			next;
 		}
 
-		$cmd = "$snapshot_cmd | mbuffer -q -Q -s 128K -m 16M $pv_cmd $compressor_cmd | $rclone $verbose_arg $dataset->{'rclone_options'} rcat ${remote_path}${compression_ext} && $rclone touch --no-create ${remote_path}${compression_ext}";
+		my $rclone_options = $dataset->{'rclone_options'};
+		if (!defined $rclone_options) {
+			$rclone_options = '';
+		}
+		my $remote_name = (split ':', $dataset->{'target'})[0] . ':';
+		if (exists $remotes->{$remote_name} && $remotes->{$remote_name}->{'type'} eq 's3' && $rclone_options !~ /--s3-chunk-size/) {
+			my $s3_chunk_size = ceil($snapshot_size / (8 * 1024 * 1024 * 1024)) + (defined $compressor ? 0 : 1) * 2;
+			if ($s3_chunk_size < 5) {
+				$s3_chunk_size = 5; # min s3 chunk size for multipart uploads
+			}
+			if ($s3_chunk_size > (5 * 1024)) {
+				warn "WARN: using maximum --s3-chunk-size (5GB) to upload $snapshot->{'name'} due to its large size";
+				$s3_chunk_size = 5 * 1024;
+			}
+			$rclone_options .= " --s3-chunk-size ${s3_chunk_size}M";
+		}
+
+		$cmd = "$snapshot_cmd | mbuffer -q -Q -s 128K -m 16M $pv_cmd $compressor_cmd | $rclone $verbose_arg $rclone_options rcat ${remote_path}${compression_ext} && $rclone touch --no-create ${remote_path}${compression_ext}";
 		if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot->{'name'} with command '$cmd' ...\n"; }
 		my $exit_code = system("$cmd");
 		if (defined $cleanup_cmd) {
@@ -652,6 +671,20 @@ sub get_uploaded_snapshots {
 	}
 
 	return %snapshots;
+}
+
+sub get_remotes {
+	my %remotes = ();
+
+	my @lines = `$rclone listremotes --long`;
+	foreach my $line (@lines) {
+		my ($name, $type) = $line =~ /^\s*(\S+)\s+(\S+)/;
+		$remotes{$name} = {
+			'type' => $type
+		}
+	}
+
+	return %remotes;
 }
 
 sub retention_to_seconds {

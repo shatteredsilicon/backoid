@@ -1,10 +1,8 @@
-backoid (%{_version}-%{_release}) unstable; urgency=medium
-
-  * Development release
-
-backoid (1.1-1) unstable; urgency=medium
+backoid (1.1-0) unstable; urgency=medium
 
   * 1.1 release
+
+ -- Jason Ng <oblitorum@gmail.com>  Sun, 19 Aug 2025 00:44:18 +0300
 
 backoid (1.0-1) unstable; urgency=medium
 

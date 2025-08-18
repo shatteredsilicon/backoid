@@ -20,7 +20,8 @@ jobs:
 
       - name: Install prerequisite software
         run: |
-          sudo apt-get install debhelper build-essential
+          sudo apt update
+          sudo apt-get install -y debhelper build-essential
 
       - name: Check package version
         run: |
@@ -33,6 +34,7 @@ jobs:
 
       - name: Build deb package
         run: |
+          rm -f Makefile
           dpkg-buildpackage -b
           echo "DEB_PACKAGE_PATH=$(readlink -f $(ls $(pwd)/../backoid_*.deb | head -n 1))" >> $GITHUB_ENV
 
@@ -104,7 +106,7 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ github.ref_name }}
-          name: Release ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           draft: false
           prerelease: false
           artifacts: "${{ env.RPM_PACKAGE_PATH }},${{ env.DEB_PACKAGE_PATH }}"

@@ -351,12 +351,14 @@ sub upload_dataset {
 		my $snapshot_size;
 		my $snapshot_cmd;
 		my $cleanup_cmd;
+		my $mbuffer_size = '128K';
 		if (-e "$snapshot->{'path'}") {
 			my $snapshot_dir = dirname("$snapshot->{'path'}");
 			$snapshot_name = basename("$snapshot->{'path'}");
 			$snapshot_size = (`du -s --apparent-size $snapshot->{'path'}` =~ /^\s*(\w+)\s+/) * 1024; # du returns size in KB
 
-			$snapshot_cmd = "tar cf - -C $snapshot_dir $snapshot_name";
+			$snapshot_cmd = "tar cf - -C $snapshot_dir -b 128 $snapshot_name";
+			$mbuffer_size = '64K';
 			# When taring up snapshots in the invisible .zfs path finishes,
 			# zfs leaves the path mounted. Therefore we make a cleanup
 			# command to unmount it.
@@ -423,7 +425,7 @@ sub upload_dataset {
 			$rclone_options .= " --s3-chunk-size ${s3_chunk_size}M";
 		}
 
-		$cmd = "$snapshot_cmd | mbuffer -q -Q -s 128K -m 16M $pv_cmd $compressor_cmd | $rclone $verbose_arg $rclone_options rcat ${remote_path}${compression_ext} && $rclone touch --no-create ${remote_path}${compression_ext}";
+		$cmd = "$snapshot_cmd | mbuffer -q -Q -s $mbuffer_size -m 16M $pv_cmd $compressor_cmd | $rclone $verbose_arg $rclone_options rcat ${remote_path}${compression_ext} && $rclone touch --no-create ${remote_path}${compression_ext}";
 		if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot->{'name'} with command '$cmd' ...\n"; }
 		my $exit_code = system("$cmd");
 		if (defined $cleanup_cmd) {

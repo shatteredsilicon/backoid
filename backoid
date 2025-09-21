@@ -12,7 +12,6 @@ use Config::IniFiles; # read samba-style conf file
 use Getopt::Long qw(:config auto_version auto_help);
 use Pod::Usage;
 use Time::Local;
-use Sys::Hostname;
 use Capture::Tiny ':all';
 use File::Spec::Functions 'catfile';
 use File::Basename;
@@ -48,14 +47,11 @@ my $run_dir = $args{'run-dir'};
 
 make_path($run_dir);
 
-my $object_ttl = 2592000; # in seconds, 30 days
-
 if (scalar(@ARGV) != 0) {
 	pod2usage(2);
 	exit 127;
 }
 
-my $sourceisroot = 0 + ($< == 0);
 my %config = parse_config($conf_file, $default_conf_file);
 
 upload_snapshots();
@@ -358,7 +354,7 @@ sub upload_dataset {
 			$snapshot_name = basename("$snapshot->{'path'}");
 			$snapshot_size = (`du -s --apparent-size $snapshot->{'path'}` =~ /^\s*(\w+)\s+/) * 1024; # du returns size in KB
 
-			$snapshot_cmd = "tar cf - -C $snapshot_dir -b 128 $snapshot_name";
+			$snapshot_cmd = "$tar cf - -C $snapshot_dir -b 128 $snapshot_name";
 			$mbuffer_size = '64K';
 			# When taring up snapshots in the invisible .zfs path finishes,
 			# zfs leaves the path mounted. Therefore we make a cleanup
@@ -438,7 +434,7 @@ sub upload_dataset {
 			}
 		}
 
-		$cmd = "$snapshot_cmd | mbuffer -q -Q -s $mbuffer_size -m 16M $pv_cmd $compressor_cmd | $rclone_command";
+		$cmd = "$snapshot_cmd | $mbuffer -q -Q -s $mbuffer_size -m 16M $pv_cmd $compressor_cmd | $rclone_command";
 		if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot->{'name'} with command '$cmd' ...\n"; }
 		my $exit_code = system("$cmd");
 		if (defined $cleanup_cmd) {

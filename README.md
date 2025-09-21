@@ -214,6 +214,23 @@ And the definition for each option is:
 
 	options that will be passed directly to the rclone program during the upload. e.g. `rclone_options = --buffer-size=32M`
 
++	split_size
+
+	The size used to split up backup if its size exceeds this value, in human-readable format. e.g. `split_size = 1G`, `split_size = 10GB`, `split_size = 500MB`. Available suffixes are:
+
+	```
+	‘KB’ =>           1000 (KiloBytes)
+	‘K’  =>           1024 (KibiBytes)
+	‘MB’ =>      1000*1000 (MegaBytes)
+	‘M’  =>      1024*1024 (MebiBytes)
+	‘GB’ => 1000*1000*1000 (GigaBytes)
+	‘G’  => 1024*1024*1024 (GibiBytes)
+	```
+
+	and so on for ‘T’, ‘P’, ‘E’, ‘Z’, ‘Y’.
+
+	If the backup is splitted, the split files will have 3-digit numerical suffix attached to the original name. e.g. `s3:/backups/auto_snap.tar.lz4.000`, `s3:/backups/auto_snap.tar.lz4.001`, `s3:/backups/auto_snap.tar.lz4.002` and so on.
+
 And below are the available command line arguments:
 
 +   --configdir
@@ -223,6 +240,10 @@ And below are the available command line arguments:
 +   --run-dir
 
 	Specify a directory for temporary files such as lock files. Defaults to /var/run/backoid
+
++   --split-size
+
+	The global parameter for the `split_size` option in config file, has higher priority.
 
 +   --verbose
 

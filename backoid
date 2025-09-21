@@ -590,9 +590,9 @@ sub checklock {
 	close PL;
 
 	my $checkmutex = pop(@processlist);
-	chomp $checkmutex;
+	defined $checkmutex && chomp $checkmutex;
 
-	if ($checkmutex eq $lockmutex) {
+	if (defined $checkmutex && $checkmutex eq $lockmutex) {
 		# lock exists, is valid, is not owned by us - return false
 		return 0;
 	} else {

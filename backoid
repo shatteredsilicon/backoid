@@ -16,8 +16,7 @@ use Sys::Hostname;
 use Capture::Tiny ':all';
 use File::Spec::Functions 'catfile';
 use File::Basename;
-use File::Path qw(make_path rmtree);
-use Digest::SHA qw(sha256_hex);
+use File::Path qw(make_path);
 use Number::Bytes::Human qw(parse_bytes);
 use POSIX qw(ceil);
 

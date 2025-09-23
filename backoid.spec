@@ -19,7 +19,7 @@ License:	   GPLv3
 URL:		   https://github.com/shatteredsilicon/%{name}
 Source0:	   https://github.com/shatteredsilicon/%{name}/archive/v%{version}/%{name}-%{version}.tar.gz
 
-Requires:	   perl, mbuffer, lzop, pv, perl-Config-IniFiles, perl-Capture-Tiny, perl-Number-Bytes-Human, zstd, rclone, tar, lz4
+Requires:	   perl, mbuffer, lzop, pv, perl-Config-IniFiles, perl-Capture-Tiny, perl-Number-Bytes-Human, perl-Parallel-ForkManager, zstd, rclone, tar, lz4
 %if 0%{?_with_systemd}
 Requires:      systemd >= 212
 

@@ -352,7 +352,15 @@ sub upload_dataset {
 		if (-e "$snapshot->{'path'}") {
 			my $snapshot_dir = dirname("$snapshot->{'path'}");
 			$snapshot_name = basename("$snapshot->{'path'}");
-			$snapshot_size = (`du -s --apparent-size $snapshot->{'path'}` =~ /^\s*(\w+)\s+/) * 1024; # du returns size in KB
+
+			my $du_cmd = "du -s --apparent-size $snapshot->{'path'}";
+			my $du_output = `$du_cmd`;
+			if ($du_output =~ /^\s*(\d+)\s+/) {
+				$snapshot_size = $1 * 1024; # du returns size in KB
+			} else {
+				warn "CRITICAL ERROR: got an unexpected return from '$du_cmd': $du_output";
+				return;
+			}
 
 			$snapshot_cmd = "$tar cf - -C $snapshot_dir -b 128 $snapshot_name";
 			$mbuffer_size = '64K';

@@ -51,115 +51,142 @@ if (scalar(@ARGV) != 0) {
 	exit 127;
 }
 
-my %config = parse_config($conf_file, $default_conf_file);
+my %config;
+my %remotes;
+if (checklock('backoid')) {
+	writelock('backoid');
 
+	%config = parse_config($conf_file, $default_conf_file);
+	%remotes = get_remotes();
+
+	removelock('backoid');
+} else {
+	if ($verbose) { print "INFO: exiting as lock held by other backoid process.\n"; }
+	exit 0;
+}
+
+my $parent_id = $$;
 upload_snapshots();
-purge_snapshots();
+
+if (checklock('backoid')) {
+	writelock('backoid');
+
+	purge_snapshots();
+
+	removelock('backoid');
+} else {
+	if ($verbose) { print "INFO: deferring snapshot purging - valid purging lock held by other backoid process.\n"; }
+	exit 0;
+}
 
 sub upload_snapshots {
-	if (checklock('backoid')) {
-		writelock('backoid');
+	my $parallel_num = defined $parallel
+			? $parallel > 0
+				? $parallel
+				: (reduce { scalar(@{$a->{'snapshots'}}) + scalar(@{$b->{'snapshots'}}) } values %{$config{'datasets'}} || 1)
+			: 1
+			;
+	my $pm = Parallel::ForkManager->new($parallel_num);
 
-		my $parallel_num = defined $parallel
-				? $parallel > 0
-					? $parallel
-					: (reduce { scalar(@{$a->{'snapshots'}}) + scalar(@{$b->{'snapshots'}}) } values %{$config{'datasets'}} || 1)
-				: 1
-				;
-		my $pm = Parallel::ForkManager->new($parallel_num);
+	foreach my $dataset (keys %{$config{'datasets'}}) {
+		my $compressor = get_compressor($config{'datasets'}{$dataset}->{'compression'}, $config{'datasets'}{$dataset}->{'compression_level'});
+		foreach my $snapshot (@{$config{'datasets'}{$dataset}->{'snapshots'}}) {
+			$pm->start and next;
 
-		my %remotes = get_remotes();
-		my %uploaded_snapshots = get_uploaded_snapshots();
-		foreach my $dataset (keys %{$config{'datasets'}}) {
-			my $compressor = get_compressor($config{'datasets'}{$dataset}->{'compression'}, $config{'datasets'}{$dataset}->{'compression_level'});
-			foreach my $snapshot (@{$config{'datasets'}{$dataset}->{'snapshots'}}) {
-				if (defined $uploaded_snapshots{$snapshot->{'name'}}) {
+			my $lockfile = $snapshot->{'name'};
+			$lockfile =~ s/\//-/g;
+			if (checklock($lockfile)) {
+				writelock($lockfile);
+
+				my $snapshot_name = get_snapshot_name($snapshot);
+				my $remote_path = get_remote_path($config{'datasets'}{$dataset}->{'target'}, $snapshot_name, $compressor);
+				my $rclone_output = `$rclone ls $remote_path`;
+				my $rclone_exit = $? >> 8;
+				if ($rclone_exit != 0) {
+					warn "CRITICAL ERROR: failed to check if $snapshot->{'name'} is already uploaded";
+				}
+
+				defined $rclone_output && chomp($rclone_output);
+				if (defined $rclone_output && $rclone_output ne '' && $verbose) {
 					# same snapshot is uploaded, ignore
-					if ($verbose) { print "INFO: deferring snapshot uploading - snapshot $snapshot->{'name'} already uploaded.\n"; }
-					next;
+					print "INFO: deferring snapshot uploading - snapshot $snapshot->{'name'} already uploaded.\n";
 				}
 
-				$pm->start and next;
-
-				upload_snapshot($config{'datasets'}{$dataset}, $compressor, $snapshot, \%remotes);
-
-				if ($parallel_num > 1) {
-					$pm->finish;
+				if ($rclone_exit == 0 && (!defined $rclone_output || $rclone_output eq '')) {
+					upload_snapshot($config{'datasets'}{$dataset}, $compressor, $snapshot, \%remotes);
 				}
+
+				removelock($lockfile);
+			} else {
+				# per-snapshot lock is held, ignore
+				if ($verbose) { print "INFO: deferring snapshot uploading - valid per-snapshot lock of $snapshot->{'name'} held by other backoid process.\n"; }
+			}
+
+			if ($parallel_num > 1) {
+				$pm->finish;
 			}
 		}
-
-		$pm->wait_all_children;
-		removelock('backoid');
-	} else {
-		if ($verbose) { print "INFO: deferring snapshot uploading - valid uploading lock held by other backoid process.\n"; }
 	}
+
+	$pm->wait_all_children;
 }
 
 sub purge_snapshots {
-	if (checklock('backoid')) {
-		writelock('backoid');
+	my %uploaded_snapshots = get_uploaded_snapshots();
+	foreach my $dataset (keys %{$config{'datasets'}}) {
+		my ($retention_number, $retention_suffix) = ($config{'datasets'}{$dataset}{'retention'} =~ /^(\d+)([hdwmy]?)$/);
+		if (! length($retention_number) && ! length($retention_suffix)) {
+			warn "CRITICAL ERROR: auto purge for dataset '$dataset' is cancelled, backoid doesn't know how to deal with retention '$config{'datasets'}{$dataset}{'retention'}'";
+			next;
+		}
 
-		my %uploaded_snapshots = get_uploaded_snapshots();
-		foreach my $dataset (keys %{$config{'datasets'}}) {
-			my ($retention_number, $retention_suffix) = ($config{'datasets'}{$dataset}{'retention'} =~ /^(\d+)([hdwmy]?)$/);
-			if (! length($retention_number) && ! length($retention_suffix)) {
-				warn "CRITICAL ERROR: auto purge for dataset '$dataset' is cancelled, backoid doesn't know how to deal with retention '$config{'datasets'}{$dataset}{'retention'}'";
-				next;
+		my @purging_objects = ();
+		if ($retention_suffix eq '') {
+			foreach my $snapshot (keys %uploaded_snapshots) {
+				if (! ($snapshot =~ /^$dataset@/)) {
+					# not the snapshot of current dataset
+					next;
+				}
+				my %snapshot_obj = %{$uploaded_snapshots{$snapshot}};
+				my $i = 0;
+				foreach my $purging_object (@purging_objects) {
+					if ($purging_object->{'datetime'} gt $snapshot_obj{'datetime'}) {
+						last;
+					}
+
+					$i = $i + 1;
+				}
+				splice(@purging_objects, $i, 0, {
+					'datetime' => $snapshot_obj{'datetime'},
+					'objects' => $snapshot_obj{'objects'}
+				});
 			}
-
-			my @purging_objects = ();
-			if ($retention_suffix eq '') {
-				foreach my $snapshot (keys %uploaded_snapshots) {
-					if (! ($snapshot =~ /^$dataset@/)) {
-						# not the snapshot of current dataset
-						next;
-					}
-					my %snapshot_obj = %{$uploaded_snapshots{$snapshot}};
-					my $i = 0;
-					foreach my $purging_object (@purging_objects) {
-						if ($purging_object->{'datetime'} gt $snapshot_obj{'datetime'}) {
-							last;
-						}
-
-						$i = $i + 1;
-					}
-					splice(@purging_objects, $i, 0, {
-						'datetime' => $snapshot_obj{'datetime'},
-						'objects' => $snapshot_obj{'objects'}
-					});
+			splice(@purging_objects, scalar(@purging_objects) < $retention_number ? 0 : scalar(@purging_objects) - $retention_number, $retention_number, undef);
+		} else {
+			my $seconds = retention_to_seconds($retention_number, $retention_suffix);
+			foreach my $snapshot (keys %uploaded_snapshots) {
+				if (! ($snapshot =~ /^$dataset@/)) {
+					# not the snapshot of current dataset
+					next;
 				}
-				splice(@purging_objects, scalar(@purging_objects) < $retention_number ? 0 : scalar(@purging_objects) - $retention_number, $retention_number, undef);
-			} else {
-				my $seconds = retention_to_seconds($retention_number, $retention_suffix);
-				foreach my $snapshot (keys %uploaded_snapshots) {
-					if (! ($snapshot =~ /^$dataset@/)) {
-						# not the snapshot of current dataset
-						next;
-					}
-					my %snapshot_obj = %{$uploaded_snapshots{$snapshot}};
-					if (time() - timelocal($snapshot_obj{'second'},$snapshot_obj{'minute'},$snapshot_obj{'hour'},$snapshot_obj{'day'},$snapshot_obj{'month'}-1,$snapshot_obj{'year'}) < $seconds) {
-						next;
-					}
-					push(@purging_objects, {
-						'objects' => $snapshot_obj{'objects'}
-					});
+				my %snapshot_obj = %{$uploaded_snapshots{$snapshot}};
+				if (time() - timelocal($snapshot_obj{'second'},$snapshot_obj{'minute'},$snapshot_obj{'hour'},$snapshot_obj{'day'},$snapshot_obj{'month'}-1,$snapshot_obj{'year'}) < $seconds) {
+					next;
 				}
-			}
-
-			foreach my $purging_object (@purging_objects) {
-				foreach my $object (@{$purging_object->{'objects'}}) {
-					my $object_path = catfile($config{'datasets'}{$dataset}{'target'}, $object);
-					if ($debug) { print "DEBUG: purging object $object_path\n"; }
-					system("$rclone deletefile $object_path") == 0
-						or warn "CRITICAL ERROR: purge object $object_path failed, exit code: $?";
-				}
+				push(@purging_objects, {
+					'objects' => $snapshot_obj{'objects'}
+				});
 			}
 		}
 
-		removelock('backoid');
-	} else {
-		if ($verbose) { print "INFO: deferring snapshot purging - valid purging lock held by other backoid process.\n"; }
+		foreach my $purging_object (@purging_objects) {
+			foreach my $object (@{$purging_object->{'objects'}}) {
+				my $object_path = catfile($config{'datasets'}{$dataset}{'target'}, $object);
+				if ($debug) { print "DEBUG: purging object $object_path\n"; }
+				system("$rclone deletefile $object_path") == 0
+					or warn "CRITICAL ERROR: purge object $object_path failed, exit code: $?";
+			}
+		}
 	}
 }
 
@@ -359,14 +386,13 @@ sub upload_snapshot {
 
 	my $file_arg = '';
 	my $cmd = '';
-	my $snapshot_name;
+	my $snapshot_name = get_snapshot_name($snapshot);
 	my $snapshot_size;
 	my $snapshot_cmd;
 	my $cleanup_cmd;
 	my $mbuffer_size = '128K';
 	if (-e "$snapshot->{'path'}") {
 		my $snapshot_dir = dirname("$snapshot->{'path'}");
-		$snapshot_name = basename("$snapshot->{'path'}");
 
 		my $du_cmd = "du -s --apparent-size $snapshot->{'path'}";
 		my $du_output = `$du_cmd`;
@@ -384,10 +410,6 @@ sub upload_snapshot {
 		# command to unmount it.
 		$cleanup_cmd = "umount $snapshot->{'path'}";
 	} else {
-		$snapshot_name = $snapshot->{'name'};
-		$snapshot_name =~ s#@#/#;
-		$snapshot_name = basename($snapshot_name);
-
 		my $cmd = "$zfs send -nP $snapshot->{'name'}";
 		if ($debug) { print "DEBUG: getting size of snapshot '$snapshot->{'name'}' using '$cmd' ...\n"; }
 		my @lines = `$cmd`;
@@ -408,7 +430,7 @@ sub upload_snapshot {
 		$snapshot_cmd = "$zfs send $dataset->{'zfs_send_options'} $snapshot->{'name'}";
 	}
 
-	my $remote_path = catfile($dataset->{'target'}, $snapshot_name);
+	my $remote_path = get_remote_path($dataset->{'target'}, $snapshot_name, $compressor);
 
 	my $verbose_arg = '';
 	my $pv_cmd = '';
@@ -418,15 +440,6 @@ sub upload_snapshot {
 	}
 
 	my $compressor_cmd = defined $compressor ? '| ' . gen_compressor_cmd($compressor, $snapshot_size, $dataset->{'compressor_options'}) : '';
-	my $compression_ext = defined $compressor ? ".tar.$compressor->{'extension'}" : '';
-
-	my $check_cmd = "$rclone ls $dataset->{'target'} --include '$snapshot_name.tar.*'";
-	if ($debug) { print "DEBUG: checking if snapshot $snapshot->{'name'} exists on remote with command '$check_cmd' ...\n"; }
-	my $check_output = `$check_cmd`;
-	if ($check_output ne '') {
-		if ($verbose) { print "INFO: deferring snapshot uploading - snapshot $snapshot->{'name'} already exists on remote.\n"; }
-		next;
-	}
 
 	my $rclone_options = $dataset->{'rclone_options'};
 	if (!defined $rclone_options) {
@@ -451,7 +464,7 @@ sub upload_snapshot {
 		}
 	}
 
-	my $rclone_command = "$rclone $verbose_arg $rclone_options rcat ${remote_path}${compression_ext} && $rclone touch --no-create ${remote_path}${compression_ext}";
+	my $rclone_command = "$rclone $verbose_arg $rclone_options rcat ${remote_path} && $rclone touch --no-create ${remote_path}";
 	my $dataset_split_size = $dataset->{'split_size'};
 	if (defined $split_size && "$split_size" ne '') {
 		$dataset_split_size = $split_size;
@@ -459,7 +472,7 @@ sub upload_snapshot {
 	if (defined $dataset_split_size && "$dataset_split_size" ne '') {
 		my $split_bytes = parse_bytes("$dataset_split_size");
 		if ($snapshot_size > $split_bytes) {
-			$rclone_command = "split -b $split_bytes -d -a 3 --filter=\"$rclone $verbose_arg $rclone_options rcat ${remote_path}${compression_ext}\\\$FILE && $rclone touch --no-create ${remote_path}${compression_ext}\\\$FILE\" - .";
+			$rclone_command = "split -b $split_bytes -d -a 3 --filter=\"$rclone $verbose_arg $rclone_options rcat ${remote_path}\\\$FILE && $rclone touch --no-create ${remote_path}\\\$FILE\" - .";
 		}
 	}
 
@@ -473,6 +486,24 @@ sub upload_snapshot {
 		warn "CRITICAL ERROR: taring up and uploading snapshot $snapshot->{'name'} failed";
 		return;
 	};
+}
+
+sub get_snapshot_name {
+	my ($snapshot) = @_;
+
+	if (-e "$snapshot->{'path'}") {
+		return basename("$snapshot->{'path'}");
+	} else {
+		my $snapshot_name = $snapshot->{'name'};
+		$snapshot_name =~ s#@#/#;
+		return basename($snapshot_name);
+	}
+}
+
+sub get_remote_path {
+	my ($target, $snapshot_name, $compressor) = @_;
+
+	return catfile($target, $snapshot_name) . (defined $compressor ? ".tar.$compressor->{'extension'}" : '');
 }
 
 sub get_compressor {
@@ -613,14 +644,19 @@ sub checklock {
 		# we own the lockfile. no need to check any further.
 		return 2;
 	}
-	open PL, "$ps -p $lockpid -o args= |";
+	open PL, "$ps -p $lockpid -o ppid= |";
 	my @processlist = <PL>;
 	close PL;
 
-	my $checkmutex = pop(@processlist);
-	defined $checkmutex && chomp $checkmutex;
+	my $ppid = pop(@processlist);
+	defined $ppid && chomp $ppid;
 
-	if (defined $checkmutex && $checkmutex eq $lockmutex) {
+	if (defined $ppid && $ppid == $parent_id) {
+		# parent own the lockfile, no need to check any further.
+		return 3;
+	}
+
+	if (defined $ppid) {
 		# lock exists, is valid, is not owned by us - return false
 		return 0;
 	} else {
@@ -639,10 +675,11 @@ sub removelock {
 	my $lockname = shift;
 	my $lockfile = "$run_dir/$lockname.lock";
 
-	if (checklock($lockname) == 2) {
+	my $checklock_exit = checklock($lockname);
+	if ($checklock_exit == 2) {
 		unlink $lockfile;
 		return;
-	} elsif (checklock($lockname) == 1) {
+	} elsif ($checklock_exit == 1) {
 		die "ERROR: No valid lockfile found - Did a rogue process or user update or delete it?\n";
 	} else {
 		die "ERROR: A valid lockfile exists but does not belong to me! I refuse to remove it.\n";
@@ -672,7 +709,7 @@ sub writelock {
 	my $mutex = pop(@processlist);
 	chomp $mutex;
 
-	open FH, "> $lockfile";
+	open FH, "> $lockfile" or die "CRITICAL ERROR: failed to create lock file $lockfile.\n";
 	print FH "$pid\n";
 	print FH "$mutex\n";
 	close FH;
@@ -727,6 +764,7 @@ sub get_remotes {
 	my @lines = `$rclone listremotes --long`;
 	foreach my $line (@lines) {
 		my ($name, $type) = $line =~ /^\s*(\S+)\s+(\S+)/;
+		if (!defined $name) { next; }
 		$remotes{$name} = {
 			'type' => $type
 		}

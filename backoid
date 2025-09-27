@@ -83,14 +83,37 @@ sub upload_snapshots {
 	my $parallel_num = defined $parallel
 			? $parallel > 0
 				? $parallel
-				: (reduce { scalar(@{$a->{'snapshots'}}) + scalar(@{$b->{'snapshots'}}) } values %{$config{'datasets'}} || 1)
+				: ((reduce { $a + scalar(@{$b->{'snapshots'}}) } 0, values %{$config{'datasets'}}) || 1)
 			: 1
 			;
 	my $pm = Parallel::ForkManager->new($parallel_num);
 
 	foreach my $dataset (keys %{$config{'datasets'}}) {
 		my $compressor = get_compressor($config{'datasets'}{$dataset}->{'compression'}, $config{'datasets'}{$dataset}->{'compression_level'});
-		foreach my $snapshot (@{$config{'datasets'}{$dataset}->{'snapshots'}}) {
+		my @snapshots = get_snapshots($dataset, $config{'datasets'}{$dataset});
+		for (my $i = 0; $i < (scalar(@snapshots)+1); $i++) { # run one more time to see if there are new snapshots created
+			if (scalar($pm->running_procs) >= $parallel_num) {
+				$pm->wait_for_available_procs(1);
+				my @new_snapshots = get_snapshots($dataset, $config{'datasets'}{$dataset});
+				my $snapshot_list_changed = 0;
+				if (scalar(@snapshots) != scalar(@new_snapshots)) {
+					$snapshot_list_changed = 1;
+				} else {
+					for (my $si = 0; $si < scalar(@new_snapshots); $si++) {
+						if ($snapshots[$si]->{'timestamp'} != $new_snapshots[$si]->{'timestamp'} || $snapshots[$si]->{'name'} ne $new_snapshots[$si]->{'name'}) {
+							$snapshot_list_changed = 1;
+							last;
+						}
+					}
+				}
+				if ($snapshot_list_changed) {
+					# if snapshot list changed, just use the new snapshot list
+					@snapshots = @new_snapshots;
+					$i = 0;
+				}
+			}
+			if ($i == scalar(@snapshots)) { last; }
+			my $snapshot = $snapshots[$i];
 			$pm->start and next;
 
 			my $lockfile = $snapshot->{'name'};
@@ -122,9 +145,7 @@ sub upload_snapshots {
 				if ($verbose) { print "INFO: deferring snapshot uploading - valid per-snapshot lock of $snapshot->{'name'} held by other backoid process.\n"; }
 			}
 
-			if ($parallel_num > 1) {
-				$pm->finish;
-			}
+			$pm->finish;
 		}
 	}
 
@@ -269,24 +290,8 @@ sub parse_config {
 
 	foreach my $dataset (keys %{$config{'datasets'}}) {
 		$config{'datasets'}{$dataset}{'snapshots'} = [];
-
-		my @snapshots = get_snapshots($dataset, $config{'datasets'}{$dataset}{'retention'}, $config{'datasets'}{$dataset}{'pattern'});
-		foreach my $snapshot (@snapshots) {
-			my $trim_snapshot = $snapshot;
-			$trim_snapshot =~ s/^$dataset@//;
-			my $snapshot_path = '';
-
-			if ($config{'datasets'}{$dataset}{'mountpoint'} ne "") {
-				$snapshot_path = catfile($config{'datasets'}{$dataset}{'mountpoint'}, ".zfs", "snapshot", "$trim_snapshot");
-			}
-
-			if ($debug) { print "DEBUG: found snapshot $snapshot\n"; }
-			my %snapshot_obj = (
-				'name' => "$snapshot",
-				'path' => "$snapshot_path"
-			);
-			push(@{$config{'datasets'}{$dataset}{'snapshots'}}, \%snapshot_obj);
-		}
+		my @snapshots = get_snapshots($dataset, $config{'datasets'}{$dataset});
+		push(@{$config{'datasets'}{$dataset}{'snapshots'}}, @snapshots);
 	}
 
 	return %config;
@@ -330,8 +335,8 @@ sub get_zfs_datasets {
 }
 
 sub get_snapshots {
-	my ($dataset, $retention, $pattern) = @_;
-	my ($retention_number, $retention_suffix) = ($retention =~ /^(\d+)([hdwmy]?)$/);
+	my ($dataset, $dataset_hash) = @_;
+	my ($retention_number, $retention_suffix) = ($dataset_hash->{'retention'} =~ /^(\d+)([hdwmy]?)$/);
 	my @snapshots = ();
 
 	my $cmd = "$zfs list -o name,creation -t snapshot -S creation -H -p $dataset 2>&1";
@@ -357,7 +362,7 @@ sub get_snapshots {
 
 		my $trim_snapshot = $snapshot;
 		$trim_snapshot =~ s/^$dataset@//;
-		if (! ($trim_snapshot =~ /$pattern/)) {
+		if (! ($trim_snapshot =~ /$dataset_hash->{'pattern'}/)) {
 			next;
 		}
 
@@ -374,7 +379,19 @@ sub get_snapshots {
 			last;
 		}
 
-		push(@snapshots, $snapshot);
+		my $snapshot_path = '';
+		if ($dataset_hash->{'mountpoint'} ne "") {
+			$snapshot_path = catfile($dataset_hash->{'mountpoint'}, ".zfs", "snapshot", "$trim_snapshot");
+		}
+
+		if ($debug) { print "DEBUG: found snapshot $snapshot\n"; }
+		my %snapshot_obj = (
+			'name' => $snapshot,
+			'path' => $snapshot_path,
+			'timestamp' => $timestamp,
+		);
+
+		push(@snapshots, \%snapshot_obj);
 		$snapshot_count += 1;
 	}
 
@@ -676,7 +693,7 @@ sub removelock {
 	my $lockfile = "$run_dir/$lockname.lock";
 
 	my $checklock_exit = checklock($lockname);
-	if ($checklock_exit == 2) {
+	if ($checklock_exit == 2 || $checklock_exit == 3) {
 		unlink $lockfile;
 		return;
 	} elsif ($checklock_exit == 1) {

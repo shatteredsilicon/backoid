@@ -16,10 +16,13 @@ use Capture::Tiny ':all';
 use File::Spec::Functions 'catfile';
 use File::Basename;
 use File::Path qw(make_path);
-use List::Util qw(reduce);
+use List::Util qw(reduce first);
 use Number::Bytes::Human qw(parse_bytes);
 use POSIX qw(ceil);
 use Parallel::ForkManager;
+use IO::Handle;
+use IPC::Open3;
+use Symbol 'gensym';
 
 my $ps = 'ps';
 my $pv = 'pv';
@@ -80,76 +83,157 @@ if (checklock('backoid')) {
 }
 
 sub upload_snapshots {
-	my $parallel_num = defined $parallel
+	my $log_pipe_exit = pipe(my $log_read_fh, my $log_write_fh);
+	if (!$log_pipe_exit) {
+		warn "CRITICAL ERROR: failed to create pipe for progress";
+		return;
+	}
+
+	my $pid = fork();
+	if (!defined $pid) {
+		warn "CRITICAL ERROR: failed to fork";
+		return;
+	} elsif ($pid == 0) {
+		close($log_write_fh);
+		STDOUT->autoflush(1);
+
+		my @snapshots = ();
+
+		my $stdout_line;
+		while (my $log_line = <$log_read_fh>) {
+			my $prev_progress_lines = reduce {$a + 3 + $b->{'lines'}} 0, @snapshots;
+
+			my $stdout_output = '';
+			my $stderr_output;
+			if ($log_line =~ /^progress /) {
+				$log_line =~ s/^progress //;
+				chomp $log_line;
+				if ($log_line eq '') { next; }
+
+				my ($snapshot_name, $content) = split /\s+/, $log_line, 2;
+				if (!defined $snapshot_name || !defined $content || $content eq '') { next; }
+
+				my $snapshot = first { $_->{'name'} eq $snapshot_name } @snapshots;
+				if (!defined $snapshot) {
+					$snapshot = {
+						'name' => $snapshot_name,
+						'content' => $content,
+						'lines' => $log_line =~ tr/\n//
+					};
+					push @snapshots, $snapshot;
+				} else {
+					$snapshot->{'content'} = $content;
+				}
+			} elsif ($log_line =~ /^stderr /) {
+				$log_line =~ s/^stderr //;
+				$stderr_output = $log_line;
+			} elsif ($log_line =~ /^stdout /) {
+				$log_line =~ s/^stdout //;
+				$stdout_output = $log_line;
+			} else {
+				$stdout_output = $log_line;
+			}
+
+			for (my $i = 0; $i < scalar(@snapshots); $i++) {
+				$stdout_output .= ($snapshots[$i]->{'name'} . ":\n");
+				$stdout_output .= ($snapshots[$i]->{'content'} . "\n");
+				if ($i < scalar(@snapshots)-1) {
+					$stdout_output .= "\n";
+				}
+			}
+			$prev_progress_lines > 0 && print "\033[" . ($prev_progress_lines - 1) . "F";
+			print "\033[0J";
+			if (defined $stderr_output) {
+				print $stderr_output;
+			}
+			print $stdout_output;
+		}
+
+		close($log_read_fh);
+		exit 0;
+	} else {
+		close($log_read_fh);
+		$log_write_fh->autoflush(1);
+
+		my $parallel_num = defined $parallel
 			? $parallel > 0
 				? $parallel
 				: ((reduce { $a + scalar(@{$b->{'snapshots'}}) } 0, values %{$config{'datasets'}}) || 1)
 			: 1
 			;
-	my $pm = Parallel::ForkManager->new($parallel_num);
+		my $pm = Parallel::ForkManager->new($parallel_num);
 
-	foreach my $dataset (keys %{$config{'datasets'}}) {
-		my $compressor = get_compressor($config{'datasets'}{$dataset}->{'compression'}, $config{'datasets'}{$dataset}->{'compression_level'});
-		my @snapshots = get_snapshots($dataset, $config{'datasets'}{$dataset});
-		for (my $i = 0; $i < (scalar(@snapshots)+1); $i++) { # run one more time to see if there are new snapshots created
-			if (scalar($pm->running_procs) >= $parallel_num) {
-				$pm->wait_for_available_procs(1);
-				my @new_snapshots = get_snapshots($dataset, $config{'datasets'}{$dataset});
-				my $snapshot_list_changed = 0;
-				if (scalar(@snapshots) != scalar(@new_snapshots)) {
-					$snapshot_list_changed = 1;
-				} else {
-					for (my $si = 0; $si < scalar(@new_snapshots); $si++) {
-						if ($snapshots[$si]->{'timestamp'} != $new_snapshots[$si]->{'timestamp'} || $snapshots[$si]->{'name'} ne $new_snapshots[$si]->{'name'}) {
-							$snapshot_list_changed = 1;
-							last;
+		foreach my $dataset (keys %{$config{'datasets'}}) {
+			my $compressor = get_compressor($config{'datasets'}{$dataset}->{'compression'}, $config{'datasets'}{$dataset}->{'compression_level'});
+			my @snapshots = get_snapshots($dataset, $config{'datasets'}{$dataset}, $log_write_fh);
+			for (my $i = 0; $i < (scalar(@snapshots)+1); $i++) { # run one more time to see if there are new snapshots created
+				if (scalar($pm->running_procs) >= $parallel_num) {
+					$pm->wait_for_available_procs(1);
+					my @new_snapshots = get_snapshots($dataset, $config{'datasets'}{$dataset}, $log_write_fh);
+					my $snapshot_list_changed = 0;
+					if (scalar(@snapshots) != scalar(@new_snapshots)) {
+						$snapshot_list_changed = 1;
+					} else {
+						for (my $si = 0; $si < scalar(@new_snapshots); $si++) {
+							if ($snapshots[$si]->{'timestamp'} != $new_snapshots[$si]->{'timestamp'} || $snapshots[$si]->{'name'} ne $new_snapshots[$si]->{'name'}) {
+								$snapshot_list_changed = 1;
+								last;
+							}
 						}
 					}
+					if ($snapshot_list_changed) {
+						# if snapshot list changed, just use the new snapshot list
+						@snapshots = @new_snapshots;
+						$i = 0;
+					}
 				}
-				if ($snapshot_list_changed) {
-					# if snapshot list changed, just use the new snapshot list
-					@snapshots = @new_snapshots;
-					$i = 0;
+				if ($i == scalar(@snapshots)) { last; }
+				my $snapshot = $snapshots[$i];
+				$pm->start and next;
+
+				my $lockfile = $snapshot->{'name'};
+				$lockfile =~ s/\//-/g;
+				if (checklock($lockfile)) {
+					writelock($lockfile);
+
+					my $snapshot_name = get_snapshot_name($snapshot);
+					my $remote_path = get_remote_path($config{'datasets'}{$dataset}->{'target'}, $snapshot_name, $compressor);
+					my $remote_path_basename = basename($remote_path);
+					my $rclone_output;
+					if (defined $config{'datasets'}{$dataset}->{'method'} && $config{'datasets'}{$dataset}->{'method'} eq 'files') {
+						$rclone_output = `$rclone ls $remote_path`;
+					} else {
+						$rclone_output = `$rclone ls $config{'datasets'}{$dataset}->{'target'} --include "$remote_path_basename" --include "$remote_path_basename.000"`;
+					}
+					my $rclone_exit = $? >> 8;
+					if ($rclone_exit != 0) {
+						send_log($log_write_fh, "stderr", "CRITICAL ERROR: failed to check if $snapshot->{'name'} is already uploaded");
+					}
+
+					defined $rclone_output && chomp($rclone_output);
+					if (defined $rclone_output && $rclone_output ne '' && $verbose) {
+						# same snapshot is uploaded, ignore
+						send_log($log_write_fh, "stdout", "INFO: deferring snapshot uploading - snapshot $snapshot->{'name'} already uploaded.\n");
+					}
+
+					if ($rclone_exit == 0 && (!defined $rclone_output || $rclone_output eq '')) {
+						upload_snapshot($config{'datasets'}{$dataset}, $compressor, $snapshot, \%remotes, $log_write_fh);
+					}
+
+					removelock($lockfile);
+				} else {
+					# per-snapshot lock is held, ignore
+					if ($verbose) { send_log($log_write_fh, "stdout", "INFO: deferring snapshot uploading - valid per-snapshot lock of $snapshot->{'name'} held by other backoid process.\n"); }
 				}
+
+				$pm->finish;
 			}
-			if ($i == scalar(@snapshots)) { last; }
-			my $snapshot = $snapshots[$i];
-			$pm->start and next;
-
-			my $lockfile = $snapshot->{'name'};
-			$lockfile =~ s/\//-/g;
-			if (checklock($lockfile)) {
-				writelock($lockfile);
-
-				my $snapshot_name = get_snapshot_name($snapshot);
-				my $remote_path = get_remote_path($config{'datasets'}{$dataset}->{'target'}, $snapshot_name, $compressor);
-				my $rclone_output = `$rclone ls $remote_path`;
-				my $rclone_exit = $? >> 8;
-				if ($rclone_exit != 0) {
-					warn "CRITICAL ERROR: failed to check if $snapshot->{'name'} is already uploaded";
-				}
-
-				defined $rclone_output && chomp($rclone_output);
-				if (defined $rclone_output && $rclone_output ne '' && $verbose) {
-					# same snapshot is uploaded, ignore
-					print "INFO: deferring snapshot uploading - snapshot $snapshot->{'name'} already uploaded.\n";
-				}
-
-				if ($rclone_exit == 0 && (!defined $rclone_output || $rclone_output eq '')) {
-					upload_snapshot($config{'datasets'}{$dataset}, $compressor, $snapshot, \%remotes);
-				}
-
-				removelock($lockfile);
-			} else {
-				# per-snapshot lock is held, ignore
-				if ($verbose) { print "INFO: deferring snapshot uploading - valid per-snapshot lock of $snapshot->{'name'} held by other backoid process.\n"; }
-			}
-
-			$pm->finish;
 		}
-	}
 
-	$pm->wait_all_children;
+		$pm->wait_all_children;
+		close $log_write_fh;
+		waitpid($pid, 0);
+	}
 }
 
 sub purge_snapshots {
@@ -335,17 +419,18 @@ sub get_zfs_datasets {
 }
 
 sub get_snapshots {
-	my ($dataset, $dataset_hash) = @_;
+	my ($dataset, $dataset_hash, $log_fh) = @_;
+	if (!defined $log_fh) { $log_fh = *STDOUT; }
 	my ($retention_number, $retention_suffix) = ($dataset_hash->{'retention'} =~ /^(\d+)([hdwmy]?)$/);
 	my @snapshots = ();
 
 	my $cmd = "$zfs list -o name,creation -t snapshot -S creation -H -p $dataset 2>&1";
-	 if ($debug) { print "DEBUG: getting list of snapshots of $dataset using '$cmd' ...\n"; }
+	if ($debug) { send_log($log_fh, "stdout", "DEBUG: getting list of snapshots of $dataset using '$cmd' ...\n"); }
 	my @lines = `$cmd`;
 	my $exit_code = $? >> 8;
 
 	if ($exit_code != 0) {
-		warn "CRITICAL ERROR: command '$cmd' failed with exit code: $exit_code";
+		send_log($log_fh, "stderr", "CRITICAL ERROR: command '$cmd' failed with exit code: $exit_code");
 		return ();
 	}
 
@@ -356,7 +441,7 @@ sub get_snapshots {
 
 		my ($snapshot, $timestamp) = ($line =~ /^\s*(\S+)\s+(\d+)\s*$/);
 		if (! length($snapshot)) {
-			warn "CRITICAL ERROR: get unexpected line from zfs list output -> '$line'";
+			send_log($log_fh, "stderr", "CRITICAL ERROR: get unexpected line from zfs list output -> '$line'");
 			next;
 		}
 
@@ -384,7 +469,7 @@ sub get_snapshots {
 			$snapshot_path = catfile($dataset_hash->{'mountpoint'}, ".zfs", "snapshot", "$trim_snapshot");
 		}
 
-		if ($debug) { print "DEBUG: found snapshot $snapshot\n"; }
+		if ($debug) { send_log($log_fh, "stdout", "DEBUG: found snapshot $snapshot\n"); }
 		my %snapshot_obj = (
 			'name' => $snapshot,
 			'path' => $snapshot_path,
@@ -399,110 +484,161 @@ sub get_snapshots {
 }
 
 sub upload_snapshot {
-	my ($dataset, $compressor, $snapshot, $remotes) = @_;
+	my ($dataset, $compressor, $snapshot, $remotes, $log_fh) = @_;
 
-	my $file_arg = '';
-	my $cmd = '';
+	my $cmd;
+	my $method = -e "$snapshot->{'path'}" ? 'tar' : 'zfs-send';
+	if (defined $dataset->{'method'} && $dataset->{'method'} ne '' && $dataset->{'method'} ne $method) {
+		if (! grep { $_ eq $dataset->{'method'}} ('tar', 'files', 'zfs-send')) {
+			send_log($log_fh, "stderr", "CRITICAL ERROR: method $dataset->{'method'} is not acceptable");
+			return
+		}
+		if (!-e $snapshot->{'path'} && $dataset->{'method'} ne 'zfs-send') {
+			send_log($log_fh, "stderr", "CRITICAL ERROR: 'zfs-send' is the only method acceptable for mountpoint=legacy snapshots");
+			return;
+		}
+		$method = $dataset->{'method'};
+	}
+
 	my $snapshot_name = get_snapshot_name($snapshot);
-	my $snapshot_size;
-	my $snapshot_cmd;
-	my $cleanup_cmd;
-	my $mbuffer_size = '128K';
-	if (-e "$snapshot->{'path'}") {
-		my $snapshot_dir = dirname("$snapshot->{'path'}");
-
-		my $du_cmd = "du -s --apparent-size $snapshot->{'path'}";
-		my $du_output = `$du_cmd`;
-		if ($du_output =~ /^\s*(\d+)\s+/) {
-			$snapshot_size = $1 * 1024; # du returns size in KB
-		} else {
-			warn "CRITICAL ERROR: got an unexpected return from '$du_cmd': $du_output";
-			return;
-		}
-
-		$snapshot_cmd = "$tar cf - -C $snapshot_dir -b 128 $snapshot_name";
-		$mbuffer_size = '64K';
-		# When taring up snapshots in the invisible .zfs path finishes,
-		# zfs leaves the path mounted. Therefore we make a cleanup
-		# command to unmount it.
-		$cleanup_cmd = "umount $snapshot->{'path'}";
-	} else {
-		my $cmd = "$zfs send -nP $snapshot->{'name'}";
-		if ($debug) { print "DEBUG: getting size of snapshot '$snapshot->{'name'}' using '$cmd' ...\n"; }
-		my @lines = `$cmd`;
-		my $exit_code = $? >> 8;
-
-		if ($exit_code != 0) {
-			warn "CRITICAL ERROR: command '$cmd' failed with exit code: $exit_code";
-			return;
-		}
-
-		my @size_fields = split /\s+/, $lines[-1];
-		$snapshot_size = $size_fields[-1];
-		if (!defined $snapshot_size || $snapshot_size =~ /\D/) {
-			warn "CRITICAL ERROR: got an unexpected return from '$zfs send -cp -nP $snapshot->{'name'}': $snapshot_size";
-			return;
-		}
-
-		$snapshot_cmd = "$zfs send $dataset->{'zfs_send_options'} $snapshot->{'name'}";
-	}
-
 	my $remote_path = get_remote_path($dataset->{'target'}, $snapshot_name, $compressor);
-
-	my $verbose_arg = '';
-	my $pv_cmd = '';
-	if ($verbose) {
-		$verbose_arg = '-v';
-		$pv_cmd = "| $pv -c --name $snapshot->{'name'} -s $snapshot_size";
-	}
-
-	my $compressor_cmd = defined $compressor ? '| ' . gen_compressor_cmd($compressor, $snapshot_size, $dataset->{'compressor_options'}) : '';
 
 	my $rclone_options = $dataset->{'rclone_options'};
 	if (!defined $rclone_options) {
 		$rclone_options = '';
 	}
 	my $remote_name = (split ':', $dataset->{'target'})[0] . ':';
-	if (exists $remotes->{$remote_name} && $remotes->{$remote_name}->{'type'} eq 's3') {
-		if ($rclone_options !~ /--s3-chunk-size/) {
+	if (is_s3_remote($remotes, $remote_name) && $rclone_options !~ /--s3-no-check-bucket/) {
+		$rclone_options .= ' --s3-no-check-bucket';
+	}
+
+	my $cleanup_cmd;
+	if ($method eq 'files') {
+		if (is_s3_remote($remotes, $remote_name) && $rclone_options !~ /--size-only/) {
+			$rclone_options .= ' --size-only';
+		}
+		if ($verbose && $rclone_options !~ /\s--progress\s/) {
+			$rclone_options .= ' --progress';
+		}
+		$cmd = "$rclone sync $rclone_options $snapshot->{'path'} $remote_path 1>&2";
+	} else {
+		my $snapshot_size;
+		my $snapshot_cmd;
+		my $mbuffer_size = '128K';
+		if ($method eq 'tar') {
+			my $snapshot_dir = dirname("$snapshot->{'path'}");
+
+			my $du_cmd = "du -s --apparent-size $snapshot->{'path'}";
+			my $du_output = `$du_cmd`;
+			if ($du_output =~ /^\s*(\d+)\s+/) {
+				$snapshot_size = $1 * 1024; # du returns size in KB
+			} else {
+				send_log($log_fh, "stderr", "CRITICAL ERROR: got an unexpected return from '$du_cmd': $du_output");
+				return;
+			}
+
+			$snapshot_cmd = "$tar cf - -C $snapshot_dir -b 128 $snapshot_name";
+			$mbuffer_size = '64K';
+			# When taring up snapshots in the invisible .zfs path finishes,
+			# zfs leaves the path mounted. Therefore we make a cleanup
+			# command to unmount it.
+			$cleanup_cmd = "umount $snapshot->{'path'}";
+		} else {
+			my $cmd = "$zfs send -nP $snapshot->{'name'}";
+			if ($debug) { send_log($log_fh, "stdout", "DEBUG: getting size of snapshot '$snapshot->{'name'}' using '$cmd' ...\n"); }
+			my @lines = `$cmd`;
+			my $exit_code = $? >> 8;
+
+			if ($exit_code != 0) {
+				send_log($log_fh, "stderr", "CRITICAL ERROR: command '$cmd' failed with exit code: $exit_code");
+				return;
+			}
+
+			my @size_fields = split /\s+/, $lines[-1];
+			$snapshot_size = $size_fields[-1];
+			if (!defined $snapshot_size || $snapshot_size =~ /\D/) {
+				send_log($log_fh, "stderr", "CRITICAL ERROR: got an unexpected return from '$zfs send -cp -nP $snapshot->{'name'}': $snapshot_size");
+				return;
+			}
+
+			$snapshot_cmd = "$zfs send $dataset->{'zfs_send_options'} $snapshot->{'name'}";
+		}
+
+		my $pv_cmd = '';
+		if ($verbose) {
+			if ($rclone_options !~ /\s-v\s/ && $rclone_options !~ /\s--verbosse\s/ && $rclone_options !~ /\s-q\s/ && $rclone_options !~ /\s--quiet\s/) {
+				$rclone_options .= ' -v';
+			}
+			$pv_cmd = "| $pv -f -F '%b %t %r %p %e\n' -s $snapshot_size";
+		}
+
+		my $compressor_cmd = defined $compressor ? '| ' . gen_compressor_cmd($compressor, $snapshot_size, $dataset->{'compressor_options'}) : '';
+		
+		if (is_s3_remote($remotes, $remote_name) && $rclone_options !~ /--s3-chunk-size/) {
 			my $s3_chunk_size = ceil($snapshot_size / (8 * 1024 * 1024 * 1024)) + (defined $compressor ? 0 : 1) * 2;
 			if ($s3_chunk_size < 5) {
 				$s3_chunk_size = 5; # min s3 chunk size for multipart uploads
 			}
 			if ($s3_chunk_size > (5 * 1024)) {
-				warn "WARN: using maximum --s3-chunk-size (5GB) to upload $snapshot->{'name'} due to its large size";
+				send_log($log_fh, "stderr", "WARN: using maximum --s3-chunk-size (5GB) to upload $snapshot->{'name'} due to its large size");
 				$s3_chunk_size = 5 * 1024;
 			}
 			$rclone_options .= " --s3-chunk-size ${s3_chunk_size}M";
 		}
 
-		if ($rclone_options !~ /--s3-no-check-bucket/) {
-			$rclone_options .= ' --s3-no-check-bucket';
+		my $rclone_command = "$rclone $rclone_options rcat ${remote_path} 1>&2 && $rclone touch --no-create ${remote_path}";
+		my $dataset_split_size = $dataset->{'split_size'};
+		if (defined $split_size && "$split_size" ne '') {
+			$dataset_split_size = $split_size;
 		}
+		if (defined $dataset_split_size && "$dataset_split_size" ne '') {
+			my $split_bytes = parse_bytes("$dataset_split_size");
+			if ($snapshot_size > $split_bytes) {
+				$rclone_command = "split -b $split_bytes -d -a 3 --filter=\"$rclone $rclone_options rcat ${remote_path}\\\$FILE 1>&2 && $rclone touch --no-create ${remote_path}\\\$FILE\" - .";
+			}
+		}
+
+		$cmd = "$snapshot_cmd | $mbuffer -q -Q -s $mbuffer_size -m 16M $pv_cmd $compressor_cmd | $rclone_command";
 	}
 
-	my $rclone_command = "$rclone $verbose_arg $rclone_options rcat ${remote_path} && $rclone touch --no-create ${remote_path}";
-	my $dataset_split_size = $dataset->{'split_size'};
-	if (defined $split_size && "$split_size" ne '') {
-		$dataset_split_size = $split_size;
-	}
-	if (defined $dataset_split_size && "$dataset_split_size" ne '') {
-		my $split_bytes = parse_bytes("$dataset_split_size");
-		if ($snapshot_size > $split_bytes) {
-			$rclone_command = "split -b $split_bytes -d -a 3 --filter=\"$rclone $verbose_arg $rclone_options rcat ${remote_path}\\\$FILE && $rclone touch --no-create ${remote_path}\\\$FILE\" - .";
+	if ($debug) { send_log($log_fh, "stdout", "DEBUG: uploading snapshot $snapshot->{'name'} with command '$cmd' ...\n"); }
+	my $child_pid = open3(undef, undef, my $std_err = gensym, $cmd);
+	$std_err->autoflush(1);
+
+	my $pid = fork();
+	if ($pid == 0) {
+		while (my $line = <$std_err>) {
+			if ($line =~ /^\s*\S+\s+\d+\:\d+\:\d+\s+\[[^\]]+\]\s+/) { # pv progress
+				$line =~ s/^\r//;
+				send_log($log_fh, 'progress', "$snapshot->{'name'} $line");
+			} elsif ($line =~ /^Transferred\:.*\sETA\s+/) { # rclone progress
+				send_log($log_fh, 'progress', "$snapshot->{'name'} $line");
+			} elsif ($line =~ /^Transferred\:/ || $line =~ /^Elapsed time\:/ || $line =~ /^Transferring\:/) { # rclone progress
+				next;
+			} elsif ($line =~ /^\s+\*\s+/) { # rclone progress
+				my $i = index($line, 'Transferred:');
+				if ($i != -1) {
+					$line = substr($line, $i, length($line));
+					send_log($log_fh, 'progress', "$snapshot->{'name'} $line");
+				}
+			} else {
+				send_log($log_fh, 'stderr', $line);
+			}
 		}
+		exit 0;
 	}
 
-	$cmd = "$snapshot_cmd | $mbuffer -q -Q -s $mbuffer_size -m 16M $pv_cmd $compressor_cmd | $rclone_command";
-	if ($debug) { print "DEBUG: taring up and uploading snapshot $snapshot->{'name'} with command '$cmd' ...\n"; }
-	my $exit_code = system("$cmd");
+	my $reaped_child_pid = waitpid($child_pid, 0);
+	if ($reaped_child_pid == $child_pid) {
+		my $child_exit_status = $? >> 8;
+		if ($child_exit_status != 0) {
+			send_log($log_fh, "stderr", "CRITICAL ERROR: uploading snapshot $snapshot->{'name'} failed\n");
+		};
+	}
+	waitpid($pid, 0);
 	if (defined $cleanup_cmd) {
 		system("$cleanup_cmd");
 	}
-	if ($exit_code != 0) {
-		warn "CRITICAL ERROR: taring up and uploading snapshot $snapshot->{'name'} failed";
-		return;
-	};
 }
 
 sub get_snapshot_name {
@@ -790,6 +926,11 @@ sub get_remotes {
 	return %remotes;
 }
 
+sub is_s3_remote {
+	my ($remotes, $remote_name) = @_;
+	return exists $remotes->{$remote_name} && $remotes->{$remote_name}->{'type'} eq 's3';
+}
+
 sub retention_to_seconds {
 	my ($number, $suffix) = @_;
 
@@ -807,6 +948,15 @@ sub retention_to_seconds {
 	}
 
 	return $seconds;
+}
+
+sub send_log {
+	my ($fh, $type, $content) = @_;
+	if (fileno($fh) == fileno(STDOUT)) {
+		print $content;
+	} else {
+		print $fh "$type $content";
+	}
 }
 
 __END__

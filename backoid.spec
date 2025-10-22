@@ -3,7 +3,7 @@
 
 Name:		   backoid
 %if "0%{?_version}" == "0"
-Version:       1.1
+Version:       1.2
 %else
 Version:       %{_version}
 %endif

@@ -735,7 +735,7 @@ sub gen_compressor_cmd {
 	my $cmd = "$compressor->{'bin'} $compressor->{'level'} $compressor_options";
 
 	if ($compressor->{'bin'} eq 'zstd') {
-		my $size_hint = $snapshot_size < 2**32 ? $snapshot_size : (int($snapshot_size / (2**30) + 0.5) . 'G');
+		my $size_hint = $snapshot_size < 2**32 ? $snapshot_size : (int($snapshot_size / (2**20) + 0.5) . 'MiB');
 		$cmd = "$cmd --size-hint=$size_hint";
 	}
 

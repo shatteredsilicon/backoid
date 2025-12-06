@@ -307,8 +307,6 @@ sub parse_config {
 	tie my %defaults, 'Config::IniFiles', ( -file => $default_conf_file ) or die "FATAL: cannot load $default_conf_file - please restore a clean copy, this is not a user-editable file!";
 	tie my %ini, 'Config::IniFiles', ( -file => $conf_file ) or die "FATAL: cannot load $conf_file - please create a valid local config file before running backoid!";
 
-	my @istrue=(1,"true","True","TRUE","yes","Yes","YES","on","On","ON");
-
 	foreach my $section (keys %ini) {
 		# first up - die with honor if unknown parameters are set in any modules or templates by the user.
 		foreach my $key (keys %{$ini{$section}}) {
@@ -586,7 +584,12 @@ sub upload_snapshot {
 			$rclone_options .= " --s3-chunk-size ${s3_chunk_size}M";
 		}
 
-		my $rclone_command = "$rclone $rclone_options rcat ${remote_path} 1>&2 && $rclone touch --no-create ${remote_path}";
+		my $rclone_touch = '';
+		if (defined $dataset->{'rclone_touch'} && (grep $dataset->{'rclone_touch'} eq $_, (1,"true","True","TRUE","yes","Yes","YES","on","On","ON"))) {
+			$rclone_touch = "&& $rclone touch --no-create ${remote_path}";
+		}
+
+		my $rclone_command = "$rclone $rclone_options rcat ${remote_path} 1>&2 $rclone_touch";
 		my $dataset_split_size = $dataset->{'split_size'};
 		if (defined $split_size && "$split_size" ne '') {
 			$dataset_split_size = $split_size;
@@ -594,7 +597,10 @@ sub upload_snapshot {
 		if (defined $dataset_split_size && "$dataset_split_size" ne '') {
 			my $split_bytes = parse_bytes("$dataset_split_size");
 			if ($snapshot_size > $split_bytes) {
-				$rclone_command = "split -b $split_bytes -d -a 3 --filter=\"$rclone $rclone_options rcat ${remote_path}\\\$FILE 1>&2 && $rclone touch --no-create ${remote_path}\\\$FILE\" - .";
+				if ($rclone_touch ne '') {
+					$rclone_touch .= "\\\$FILE"
+				}
+				$rclone_command = "split -b $split_bytes -d -a 3 --filter=\"$rclone $rclone_options rcat ${remote_path}\\\$FILE 1>&2 $rclone_touch\" - .";
 			}
 		}
 
